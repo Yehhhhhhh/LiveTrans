@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiveTrans 同传字幕</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">LiveTrans</div>
+
+    <div class="group">
+      <label for="sourceSel">音源</label>
+      <select id="sourceSel">
+        <option value="mic">麦克风</option>
+        <option value="system">系统 / 标签页音频</option>
+        <option value="both">麦克风 + 系统音频</option>
+      </select>
+      <select id="micSel" title="麦克风设备"></select>
+    </div>
+
+    <button id="startBtn" class="primary">开始</button>
+
+    <div class="group">
+      <label for="sessionSel">课程</label>
+      <select id="sessionSel"></select>
+      <button id="newSessionBtn" title="新建课程记录">新建</button>
+      <button id="renameSessionBtn" title="重命名">重命名</button>
+      <button id="deleteSessionBtn" title="删除当前记录">删除</button>
+      <button id="exportBtn" title="导出 Markdown">导出 MD</button>
+    </div>
+
+    <div class="group">
+      <label>原文</label>
+      <button class="mini" data-font="orig" data-delta="-2">A-</button>
+      <button class="mini" data-font="orig" data-delta="2">A+</button>
+      <label>译文</label>
+      <button class="mini" data-font="trans" data-delta="-2">A-</button>
+      <button class="mini" data-font="trans" data-delta="2">A+</button>
+    </div>
+
+    <div class="group">
+      <label class="toggle" title="说话时就翻译实时识别的半句话（API 调用次数会增加数倍）"><input type="checkbox" id="tbLive"> 提前翻译</label>
+      <label class="toggle" title="使用本机 Ollama 上的模型翻译，不经过云端"><input type="checkbox" id="tbLocal"> 本地模型</label>
+    </div>
+
+    <button id="settingsBtn">设置</button>
+  </header>
+
+  <main id="transcript" class="transcript">
+    <div id="emptyHint" class="empty">
+      <p>选择音源后点击「开始」。</p>
+      <p class="sub">系统音频：在弹窗里选择「整个屏幕」或对应的标签页，并勾选「共享系统音频 / 共享标签页音频」。</p>
+    </div>
+  </main>
+
+  <button id="jumpBtn" class="jump hidden">↓ 回到最新</button>
+
+  <footer class="statusbar">
+    <span id="stWs" class="pill">后端：未连接</span>
+    <span id="stModel" class="pill">模型：-</span>
+    <span id="stVad" class="pill">● 静音</span>
+    <span class="meter"><span id="meterBar"></span></span>
+    <span id="stAsr" class="pill">识别：-</span>
+    <span id="stTr" class="pill">翻译：-</span>
+    <span id="stMsg" class="msg"></span>
+  </footer>
+
+  <!-- 设置面板 -->
+  <aside id="settings" class="drawer hidden">
+    <div class="drawer-head">
+      <h2>设置</h2>
+      <button id="closeSettings">关闭</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-tab="tr">翻译</button>
+      <button class="tab" data-tab="asr">识别</button>
+      <button class="tab" data-tab="audio">音频</button>
+      <button class="tab" data-tab="gl">术语表</button>
+      <button class="tab" data-tab="disp">显示</button>
+    </div>
+
+    <section class="pane" data-pane="tr">
+      <label class="row"><input type="checkbox" id="trEnabled"> 启用翻译</label>
+      <label class="row"><input type="checkbox" id="trLive"> 说话时提前翻译（需开启“逐词实时显示”；译文更早出现，但 API 调用次数会增加数倍）</label>
+      <label class="field">服务商
+        <select id="trProvider">
+          <option value="openai">OpenAI 兼容接口</option>
+          <option value="claude">Claude (Anthropic)</option>
+        </select>
+      </label>
+      <div id="openaiFields">
+        <label class="field">Base URL
+          <input id="oaBase" placeholder="https://api.openai.com/v1">
+        </label>
+        <p class="hint">DeepSeek：https://api.deepseek.com/v1 · 通义：https://dashscope.aliyuncs.com/compatible-mode/v1 · Ollama：http://127.0.0.1:11434/v1</p>
+        <label class="field">API Key <input id="oaKey" type="password" autocomplete="off"></label>
+        <label class="field">模型 <input id="oaModel" placeholder="如 gpt-4o-mini / deepseek-chat / qwen-plus"></label>
+      </div>
+      <div id="claudeFields">
+        <label class="field">API Key <input id="clKey" type="password" autocomplete="off"></label>
+        <label class="field">模型 <input id="clModel" list="clModels"></label>
+        <datalist id="clModels">
+          <option value="claude-opus-5-5">
+          <option value="claude-sonnet-5-5">
+          <option value="claude-haiku-5-5">
+        </datalist>
+        <label class="field">思考强度 (effort)
+          <select id="clEffort">
+            <option value="low">low（最快）</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </label>
+      </div>
+      <label class="row"><input type="checkbox" id="trLocal"> 使用本地模型（Ollama，开启后忽略上面的服务商）</label>
+      <label class="field">Ollama 地址 <input id="locBase" placeholder="http://127.0.0.1:11434"></label>
+      <label class="field">本地模型 <input id="locModel" placeholder="qwen3:4b-instruct-2507-q4_K_M"></label>
+      <p class="hint">需先安装 Ollama 并运行：ollama pull qwen3:4b-instruct-2507-q4_K_M。模型会常驻显存（约 3GB）。</p>
+      <label class="field">上下文句数 <input id="trContext" type="number" min="0" max="10"></label>
+      <div class="row">
+        <button id="trTest">测试翻译</button>
+        <span id="trTestOut" class="hint"></span>
+      </div>
+      <p class="hint">API Key 只保存在本机浏览器，请求经本地后端转发。</p>
+    </section>
+
+    <section class="pane hidden" data-pane="asr">
+      <label class="field">识别语言
+        <select id="asrLang">
+          <option value="auto">自动（意大利语 / 英语）</option>
+          <option value="it">固定意大利语</option>
+          <option value="en">固定英语</option>
+        </select>
+      </label>
+      <label class="field">语音判定阈值 <input id="vadThr" type="number" step="0.05" min="0.1" max="0.95"></label>
+      <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
+      <label class="field">单段最长 (秒) <input id="vadMax" type="number" step="1" min="3" max="20"></label>
+      <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
+      <label class="row"><input type="checkbox" id="asrPartial"> 说话时逐词实时显示（句子结束后替换为精确结果）</label>
+      <p class="hint">句末静音越短，出字越快但句子越碎；超过单段最长会在短停顿处或强制切分。</p>
+    </section>
+
+    <section class="pane hidden" data-pane="audio">
+      <label class="field">麦克风增益 <input id="micGain" type="range" min="0.5" max="4" step="0.1"> <span id="micGainV"></span></label>
+      <label class="field">系统音频增益 <input id="sysGain" type="range" min="0.5" max="4" step="0.1"> <span id="sysGainV"></span></label>
+      <label class="row"><input type="checkbox" id="micProc"> 麦克风降噪 / 自动增益（浏览器内置）</label>
+      <p class="hint">修改后需重新「开始」才生效。</p>
+    </section>
+
+    <section class="pane hidden" data-pane="gl">
+      <div class="row">
+        <input id="glSearch" placeholder="搜索术语">
+        <span id="glCount" class="hint"></span>
+      </div>
+      <div class="row">
+        <button id="glAdd">新增</button>
+        <button id="glImport">导入</button>
+        <button id="glExport">导出</button>
+        <button id="glReset">恢复默认</button>
+        <input id="glFile" type="file" accept=".json,.csv,.txt" hidden>
+      </div>
+      <p class="hint">导入支持 JSON（[{it,en,zh}]）或 CSV（意大利语,英语,中文 每行一条）。</p>
+      <div class="gl-table-wrap">
+        <table class="gl-table">
+          <thead><tr><th>意大利语</th><th>英语</th><th>中文</th><th></th></tr></thead>
+          <tbody id="glBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="pane hidden" data-pane="disp">
+      <label class="row"><input type="checkbox" id="showOrig"> 显示原文</label>
+      <label class="row"><input type="checkbox" id="autoScroll"> 自动滚动到最新</label>
+      <label class="field">原文字号 <input id="origSize" type="number" min="10" max="48"></label>
+      <label class="field">译文字号 <input id="transSize" type="number" min="12" max="64"></label>
+    </section>
+  </aside>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

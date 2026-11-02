@@ -1,0 +1,1118 @@
+import * as db from './db.js';
+
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- settings
+
+const DEFAULTS = {
+  source: 'mic',
+  micDeviceId: '',
+  audio: { micGain: 1, sysGain: 1, micProcessing: true },
+  asr: { language: 'auto', vadThreshold: 0.5, minSilenceMs: 600, maxSegmentS: 8, glossaryPrompt: true, partial: true },
+  tr: {
+    enabled: true,
+    live: true,
+    useLocal: false, // overrides provider with the local Ollama model
+    local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
+    provider: 'openai',
+    contextSize: 3,
+    openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: '' },
+    claude: { apiKey: '', model: 'claude-opus-5-5', effort: 'low' },
+  },
+  display: { origSize: 16, transSize: 22, showOrig: true, autoScroll: true },
+  currentSessionId: '',
+};
+
+function deepMerge(base, over) {
+  const out = structuredClone(base);
+  for (const [k, v] of Object.entries(over || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && typeof out[k] === 'object') {
+      out[k] = deepMerge(out[k], v);
+    } else if (k in out) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function loadJson(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage unavailable: settings just won't persist */
+  }
+}
+
+const settings = deepMerge(DEFAULTS, loadJson('livetrans.settings'));
+const saveSettings = () => saveJson('livetrans.settings', settings);
+
+let glossary = loadJson('livetrans.glossary');
+const saveGlossary = () => saveJson('livetrans.glossary', glossary);
+
+// ---------------------------------------------------------------- state
+
+const state = {
+  ws: null,
+  wsReady: false,
+  running: false,
+  audio: null, // { ctx, node, streams }
+  streamStartWall: 0,
+  session: null,
+  segments: [], // segments of the current session, in order
+  trQueue: [],
+  trBusy: false,
+  wakeLock: null,
+};
+
+// ---------------------------------------------------------------- helpers
+
+function setPill(el, text, cls = '') {
+  el.textContent = text;
+  el.className = 'pill' + (cls ? ' ' + cls : '');
+}
+
+function showMsg(text) {
+  $('stMsg').textContent = text || '';
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function fmtDateTime(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+function download(filename, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---------------------------------------------------------------- glossary
+
+async function ensureGlossary() {
+  if (Array.isArray(glossary)) return;
+  const res = await fetch('glossary_default.json');
+  glossary = await res.json();
+  saveGlossary();
+}
+
+// Whisper prompt: newest (user-added) terms first, within a character budget
+// so the 224-token prompt window isn't overflowed.
+function buildAsrPrompt() {
+  if (!settings.asr.glossaryPrompt || !glossary) return '';
+  const seen = new Set();
+  const terms = [];
+  let len = 0;
+  for (let i = glossary.length - 1; i >= 0 && len < 600; i--) {
+    for (const t of [glossary[i].en, glossary[i].it]) {
+      const k = (t || '').trim();
+      if (!k || seen.has(k.toLowerCase())) continue;
+      seen.add(k.toLowerCase());
+      terms.push(k);
+      len += k.length + 2;
+    }
+  }
+  return terms.length ? `Lezione di telecomunicazioni / Telecommunications lecture. ${terms.join(', ')}.` : '';
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function relevantGlossary(texts) {
+  const hay = texts.join(' \n ').toLowerCase();
+  const out = [];
+  for (const g of glossary || []) {
+    const hit = [g.it, g.en].some((t) => {
+      const k = (t || '').trim().toLowerCase();
+      if (k.length < 2) return false;
+      return new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRe(k)}($|[^\\p{L}\\p{N}])`, 'u').test(hay);
+    });
+    if (hit) out.push({ it: g.it, en: g.en, zh: g.zh });
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- websocket
+
+function asrConfig() {
+  return {
+    type: 'config',
+    asr: {
+      language: settings.asr.language,
+      vad_threshold: Number(settings.asr.vadThreshold),
+      min_silence_ms: Number(settings.asr.minSilenceMs),
+      max_segment_s: Number(settings.asr.maxSegmentS),
+      partial: Boolean(settings.asr.partial),
+    },
+    prompt: buildAsrPrompt(),
+  };
+}
+
+function wsSend(obj) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
+}
+
+const sendConfig = debounce(() => wsSend(asrConfig()), 300);
+
+function connectWs() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  state.ws = ws;
+
+  ws.onopen = () => {
+    state.wsReady = true;
+    setPill($('stWs'), '后端：已连接', 'ok');
+    wsSend(asrConfig());
+    if (state.running) {
+      // Backend restarted mid-capture: restart its stream clock.
+      wsSend({ type: 'start' });
+      state.streamStartWall = Date.now();
+    }
+  };
+
+  ws.onclose = () => {
+    state.wsReady = false;
+    setPill($('stWs'), '后端：未连接，重连中…', 'err');
+    setTimeout(connectWs, 2000);
+  };
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    if (msg.type === 'status') onStatus(msg);
+    else if (msg.type === 'vad') setPill($('stVad'), msg.speaking ? '● 说话中' : '● 静音', msg.speaking ? 'speaking' : '');
+    else if (msg.type === 'segment') onSegment(msg);
+    else if (msg.type === 'partial') {
+      renderPartial(msg.index, msg.text);
+      liveTranslate(msg.index, msg.text);
+    } else if (msg.type === 'partial_drop') {
+      if (live.index === msg.index) resetLive();
+      partialEl(msg.index)?.remove();
+    }
+    else if (msg.type === 'error') showMsg(msg.message);
+  };
+}
+
+function onStatus(msg) {
+  const el = $('stModel');
+  if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
+  else if (msg.model === 'loading') setPill(el, '模型：加载中（首次需下载）…', 'warn');
+  else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+  if (msg.error) showMsg(msg.error);
+}
+
+// ---------------------------------------------------------------- segments
+
+async function onSegment(msg) {
+  const text = (msg.text || '').trim();
+  // Partials of earlier segments can no longer be finalized.
+  transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
+    if (Number(el.dataset.pidx) < msg.index) el.remove();
+  });
+  if (!text || !state.session) {
+    if (live.index <= msg.index) resetLive();
+    partialEl(msg.index)?.remove();
+    return;
+  }
+  // One line per sentence; timestamps are spread over the segment by text length.
+  const sentences = splitSentences(text);
+  const total = sentences.reduce((n, s) => n + s.length, 0);
+  let offset = 0;
+  const segs = sentences.map((s) => {
+    const seg = {
+      id: crypto.randomUUID(),
+      sessionId: state.session.id,
+      ts: state.streamStartWall + (msg.start + (msg.duration * offset) / total) * 1000,
+      lang: msg.lang,
+      text: s,
+      translation: '',
+      trStatus: settings.tr.enabled ? 'pending' : 'off',
+      error: '',
+    };
+    offset += s.length;
+    return seg;
+  });
+  setPill($('stAsr'), `识别：${msg.asr_ms} ms`, 'ok');
+  if (settings.tr.enabled) takeLive(segs, msg.index);
+  if (segs.some((s) => s.trStatus === 'done')) {
+    setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
+  }
+  let prev = partialEl(msg.index);
+  segs.forEach((seg, i) => {
+    state.segments.push(seg);
+    prev = i === 0 ? renderSeg(seg, prev) : renderSeg(seg, null, prev);
+  });
+  for (const seg of segs) {
+    await db.putSegment(seg);
+    if (seg.trStatus === 'pending') enqueueTranslation(seg);
+  }
+}
+
+const wordCount = (s) => s.split(/\s+/).filter(Boolean).length;
+
+// Whisper often puts several sentences into one VAD segment; each gets its own
+// line and translation. Pieces under 3 words stay with a neighbour.
+function splitSentences(text) {
+  const out = [];
+  for (const p of text.split(/(?<=[.?!…])\s+(?=[\p{Lu}¿¡"'])/u)) {
+    if (out.length && wordCount(out.at(-1)) < 3) out[out.length - 1] += ` ${p}`;
+    else out.push(p);
+  }
+  if (out.length > 1 && wordCount(out.at(-1)) < 3) out[out.length - 2] += ` ${out.pop()}`;
+  return out;
+}
+
+function enqueueTranslation(seg) {
+  seg.trStatus = 'pending';
+  seg.error = '';
+  renderSeg(seg);
+  state.trQueue.push(seg);
+  pumpTranslations();
+}
+
+async function pumpTranslations() {
+  if (state.trBusy) return;
+  state.trBusy = true;
+  while (state.trQueue.length) {
+    const seg = state.trQueue.shift();
+    await translateSeg(seg);
+  }
+  state.trBusy = false;
+  pumpLive();
+}
+
+function translationRequest(text, context) {
+  const p = settings.tr.useLocal ? 'ollama' : settings.tr.provider;
+  return {
+    provider: p,
+    config: { claude: settings.tr.claude, openai: settings.tr.openai, ollama: settings.tr.local }[p],
+    text,
+    context,
+    glossary: relevantGlossary([text, ...context.map((c) => c.src)]),
+  };
+}
+
+// Streams the translation: onText receives the full text so far on every update.
+async function postTranslate(body, onText = () => {}, signal = undefined) {
+  const res = await fetch('/api/translate/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) buf += value;
+    const lines = buf.split('\n');
+    buf = done ? '' : lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (msg.error) throw new Error(msg.error);
+      if (msg.done) return msg.translation;
+      onText(msg.text);
+    }
+    if (done) throw new Error('翻译流意外中断');
+  }
+}
+
+// Context: the previous translated segments of the same session (all of the
+// current session's when seg is null, i.e. for the segment still being spoken).
+async function contextFor(seg) {
+  const list = !seg || seg.sessionId === state.session?.id ? state.segments : await db.getSegments(seg.sessionId);
+  const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
+  const n = Number(settings.tr.contextSize) || 0;
+  return list
+    .slice(0, idx < 0 ? list.length : idx)
+    .filter((s) => s.trStatus === 'done')
+    .slice(-n)
+    .map((s) => ({ src: s.text, tgt: s.translation }));
+}
+
+async function translateSeg(seg) {
+  // A live request already translating exactly this text is taken over rather than restarted.
+  const req = adopted.get(seg.id);
+  adopted.delete(seg.id);
+  const t0 = performance.now();
+  let first = 0;
+  const onText = (text) => {
+    if (!first) first = performance.now() - t0;
+    // With live translation on, text is never streamed in: a draft (or the
+    // placeholder) is swapped for the final translation in one go.
+    if (drafts.has(seg.id) || settings.tr.live) return;
+    seg.translation = text;
+    seg.trStatus = 'streaming';
+    renderSeg(seg);
+  };
+  try {
+    if (req) {
+      req.onText = onText;
+      seg.translation = await req.promise;
+    } else {
+      seg.translation = await postTranslate(translationRequest(seg.text, await contextFor(seg)), onText);
+    }
+    seg.trStatus = 'done';
+    const total = Math.round(performance.now() - t0);
+    setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms · 队列 ${state.trQueue.length}`, 'ok');
+  } catch (e) {
+    seg.trStatus = 'error';
+    seg.error = e.message;
+    setPill($('stTr'), '翻译：失败', 'err');
+  }
+  drafts.delete(seg.id);
+  renderSeg(seg);
+  await db.putSegment(seg);
+}
+
+// ---------------------------------------------------------------- live translation
+
+// While a segment is still being spoken, each sentence of its partial transcript
+// is translated so drafts are on screen before the final transcript arrives.
+// One request at a time, earliest untranslated sentence first (finished sentences
+// are stable; only the last one keeps changing). Final sentences whose text was
+// already translated reuse that result.
+const newLive = (index) => ({
+  index,
+  sentences: [],
+  done: new Map(), // sentence text -> translation
+  failed: new Set(), // sentence texts not to retry; the final pass still follows
+  shown: [], // per sentence position: the finished draft on screen  req: null,
+});
+let live = newLive(-1);
+// Partials drop Whisper's closing period, so it's ignored when matching sentences.
+const liveKey = (s) => s.replace(/[.…]+$/, '').trim();
+const drafts = new Map(); // seg.id -> live draft shown until the real translation replaces it
+const adopted = new Map(); // seg.id -> live request whose text equals the final sentence
+
+function resetLive(index = -1) {
+  live.req?.ctrl.abort();
+  live = newLive(index);
+}
+
+function liveTranslate(index, text) {
+  if (!settings.tr.enabled || !settings.tr.live || !state.session) return;
+  if (index !== live.index) resetLive(index);
+  live.sentences = splitSentences(text.trim());
+  pumpLive();
+}
+
+function showLive() {
+  const text = live.shown
+    .slice(0, live.sentences.length)
+    .map((d) => d || '')
+    .join('');
+  if (text) renderLiveTrans(live.index, text);
+}
+
+function pumpLive() {
+  // Final translations go first; this runs again when their queue drains.
+  if (live.req || state.trBusy) return;
+  const pos = live.sentences.findIndex((s) => s && !live.done.has(liveKey(s)) && !live.failed.has(liveKey(s)));
+  if (pos < 0) return;
+  const text = live.sentences[pos];
+  const req = {
+    text,
+    ctrl: new AbortController(),
+    // Drafts never stream: each one appears whole and replaces the previous in one go.
+    // (Replaced by the segment's handler if this request is adopted for a final sentence.)
+    onText: () => {},
+  };
+  req.promise = contextFor(null).then((ctx) =>
+    postTranslate(translationRequest(text, ctx), (t) => req.onText(t), req.ctrl.signal),
+  );
+  live.req = req;
+  req.promise
+    .then(
+      (out) => {
+        if (live.req !== req) return;
+        live.done.set(liveKey(text), out);
+        live.shown[pos] = out;
+        showLive();
+      },
+      () => {
+        if (live.req === req) live.failed.add(liveKey(text));
+      },
+    )
+    .finally(() => {
+      if (live.req !== req) return;
+      live.req = null;
+      pumpLive();
+    });
+}
+
+// Hands the live translations over to the sentences of the segment that just got
+// its final transcript: reused when the text matches, otherwise shown as drafts.
+function takeLive(segs, index) {
+  if (live.index !== index) {
+    if (live.index < index) resetLive();
+    return;
+  }
+  segs.forEach((seg, i) => {
+    const key = liveKey(seg.text);
+    if (live.done.has(key)) {
+      seg.translation = live.done.get(key);
+      seg.trStatus = 'done';
+      return;
+    }
+    if (live.req && liveKey(live.req.text) === key) {
+      adopted.set(seg.id, live.req);
+      live.req = null;
+    }
+    if (live.shown[i]) drafts.set(seg.id, live.shown[i]);
+  });
+  resetLive();
+}
+
+// ---------------------------------------------------------------- rendering
+
+const transcriptEl = $('transcript');
+let stickToBottom = true;
+
+transcriptEl.addEventListener('scroll', () => {
+  const nearBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
+  stickToBottom = nearBottom;
+  $('jumpBtn').classList.toggle('hidden', nearBottom);
+});
+
+$('jumpBtn').onclick = () => {
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+};
+
+// The live line of the segment being spoken: words pop in as Whisper hears them.
+function partialEl(index) {
+  return transcriptEl.querySelector(`.seg.live[data-pidx="${index}"]`);
+}
+
+function renderPartial(index, text) {
+  if (!state.running) return;
+  $('emptyHint').classList.add('hidden');
+  let el = partialEl(index);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'seg live';
+    el.dataset.pidx = index;
+    el.innerHTML = `<div class="meta"><span class="time">识别中…</span></div><div class="words"></div>`;
+    transcriptEl.appendChild(el);
+  }
+  // Keep the words that didn't change; animate only the new tail.
+  const box = el.querySelector('.words');
+  const words = text.split(/\s+/).filter(Boolean);
+  const spans = box.children;
+  let keep = 0;
+  while (keep < spans.length && keep < words.length && spans[keep].textContent.trimEnd() === words[keep]) keep++;
+  while (spans.length > keep) spans[spans.length - 1].remove();
+  words.slice(keep).forEach((w, i) => {
+    const span = document.createElement('span');
+    span.className = 'w';
+    span.style.animationDelay = `${Math.min(i * 70, 500)}ms`;
+    span.textContent = `${w} `;
+    box.appendChild(span);
+  });
+  if (settings.display.autoScroll && stickToBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function renderLiveTrans(index, text) {
+  const el = partialEl(index);
+  if (!el) return;
+  let tr = el.querySelector('.trans');
+  if (!tr) {
+    tr = document.createElement('div');
+    tr.className = 'trans draft';
+    el.appendChild(tr);
+  }
+  tr.textContent = text;
+  if (settings.display.autoScroll && stickToBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function renderSeg(seg, replace = null, after = null) {
+  if (seg.sessionId !== state.session?.id) return;
+  $('emptyHint').classList.add('hidden');
+  let el = transcriptEl.querySelector(`[data-id="${seg.id}"]`);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'seg';
+    el.dataset.id = seg.id;
+    el.innerHTML = `<div class="meta"><span class="time"></span><span class="lang"></span></div>
+      <div class="orig"></div><div class="trans"></div>`;
+    if (replace) replace.replaceWith(el);
+    else if (after) after.after(el);
+    else transcriptEl.appendChild(el);
+  }
+  el.querySelector('.time').textContent = fmtTime(seg.ts);
+  const lang = el.querySelector('.lang');
+  lang.textContent = (seg.lang || '?').toUpperCase();
+  lang.className = `lang ${seg.lang || ''}`;
+  el.querySelector('.orig').textContent = seg.text;
+
+  const tr = el.querySelector('.trans');
+  tr.className = 'trans';
+  if (seg.trStatus === 'done') tr.textContent = seg.translation;
+  else if (seg.trStatus === 'streaming') {
+    tr.textContent = seg.translation;
+    tr.classList.add('streaming');
+  } else if (seg.trStatus === 'pending' && drafts.has(seg.id)) {
+    tr.textContent = drafts.get(seg.id);
+    tr.classList.add('draft');
+  } else if (seg.trStatus === 'pending') {
+    tr.textContent = '翻译中…';
+    tr.classList.add('pending');
+  } else if (seg.trStatus === 'error') {
+    tr.textContent = `翻译失败：${seg.error}`;
+    tr.classList.add('error');
+  } else tr.textContent = '';
+
+  let retry = el.querySelector('.retry');
+  if (seg.trStatus === 'error' || seg.trStatus === 'off' || seg.trStatus === 'done') {
+    if (!retry) {
+      retry = document.createElement('button');
+      retry.className = 'retry';
+      retry.onclick = () => enqueueTranslation(seg);
+      el.querySelector('.meta').appendChild(retry);
+    }
+    retry.textContent = seg.trStatus === 'done' ? '重译' : '翻译';
+  } else if (retry) retry.remove();
+
+  if (settings.display.autoScroll && stickToBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  return el;
+}
+
+function renderAll() {
+  transcriptEl.querySelectorAll('.seg').forEach((e) => e.remove());
+  $('emptyHint').classList.toggle('hidden', state.segments.length > 0);
+  stickToBottom = true;
+  for (const s of state.segments) renderSeg(s);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function applyDisplay() {
+  const d = settings.display;
+  document.documentElement.style.setProperty('--orig-size', `${d.origSize}px`);
+  document.documentElement.style.setProperty('--trans-size', `${d.transSize}px`);
+  document.body.classList.toggle('hide-orig', !d.showOrig);
+}
+
+// ---------------------------------------------------------------- sessions
+
+async function refreshSessionList() {
+  const sessions = await db.listSessions();
+  const sel = $('sessionSel');
+  sel.innerHTML = '';
+  for (const s of sessions) {
+    const o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = s.title;
+    sel.appendChild(o);
+  }
+  if (state.session) sel.value = state.session.id;
+  return sessions;
+}
+
+async function createSession(title) {
+  const now = Date.now();
+  const s = { id: crypto.randomUUID(), title: title || `课程 ${fmtDateTime(now)}`, createdAt: now };
+  await db.putSession(s);
+  await openSession(s);
+}
+
+async function openSession(s) {
+  state.session = s;
+  settings.currentSessionId = s.id;
+  saveSettings();
+  state.segments = await db.getSegments(s.id);
+  await refreshSessionList();
+  renderAll();
+}
+
+async function initSessions() {
+  const sessions = await db.listSessions();
+  const cur = sessions.find((s) => s.id === settings.currentSessionId) || sessions[0];
+  if (cur) await openSession(cur);
+  else await createSession();
+}
+
+$('sessionSel').onchange = async () => {
+  const sessions = await db.listSessions();
+  const s = sessions.find((x) => x.id === $('sessionSel').value);
+  if (s) await openSession(s);
+};
+
+$('newSessionBtn').onclick = async () => {
+  const title = prompt('课程名称', `课程 ${fmtDateTime(Date.now())}`);
+  if (title !== null) await createSession(title.trim() || undefined);
+};
+
+$('renameSessionBtn').onclick = async () => {
+  if (!state.session) return;
+  const title = prompt('重命名', state.session.title);
+  if (!title || !title.trim()) return;
+  state.session.title = title.trim();
+  await db.putSession(state.session);
+  await refreshSessionList();
+};
+
+$('deleteSessionBtn').onclick = async () => {
+  if (!state.session) return;
+  if (!confirm(`删除「${state.session.title}」及其全部 ${state.segments.length} 条记录？此操作不可恢复。`)) return;
+  await db.deleteSession(state.session.id);
+  state.session = null;
+  await initSessions();
+};
+
+$('exportBtn').onclick = () => {
+  const s = state.session;
+  if (!s) return;
+  const lines = [`# ${s.title}`, '', `- 创建时间：${fmtDateTime(s.createdAt)}`, `- 段数：${state.segments.length}`, '', '---', ''];
+  for (const seg of state.segments) {
+    lines.push(`**[${fmtTime(seg.ts)}] ${(seg.lang || '').toUpperCase()}**  `);
+    lines.push(seg.text);
+    lines.push('');
+    if (seg.translation) {
+      lines.push(`> ${seg.translation}`);
+      lines.push('');
+    }
+  }
+  const safe = s.title.replace(/[\\/:*?"<>|]/g, '_');
+  download(`${safe}.md`, lines.join('\n'), 'text/markdown;charset=utf-8');
+};
+
+// ---------------------------------------------------------------- audio
+
+async function listMics() {
+  const sel = $('micSel');
+  let devices = [];
+  try {
+    devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+  } catch {
+    /* no permission yet */
+  }
+  sel.innerHTML = '';
+  devices.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.textContent = d.label || `麦克风 ${i + 1}`;
+    sel.appendChild(o);
+  });
+  if (settings.micDeviceId && devices.some((d) => d.deviceId === settings.micDeviceId)) sel.value = settings.micDeviceId;
+}
+
+async function getSystemStream() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    systemAudio: 'include',
+    selfBrowserSurface: 'exclude',
+  });
+  if (stream.getAudioTracks().length === 0) {
+    stream.getTracks().forEach((t) => t.stop());
+    throw new Error('没有获取到音频：请在共享弹窗中勾选「共享系统音频」或「共享标签页音频」');
+  }
+  // Only the audio is used; keep the video track alive but idle.
+  stream.getVideoTracks().forEach((t) => (t.enabled = false));
+  return stream;
+}
+
+async function getMicStream() {
+  const proc = settings.audio.micProcessing;
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      deviceId: settings.micDeviceId ? { exact: settings.micDeviceId } : undefined,
+      channelCount: 1,
+      echoCancellation: proc,
+      noiseSuppression: proc,
+      autoGainControl: proc,
+    },
+  });
+}
+
+async function start() {
+  if (!state.wsReady) {
+    showMsg('后端未连接，请先运行 start.bat');
+    return;
+  }
+  showMsg('');
+  const src = settings.source;
+  const streams = [];
+  try {
+    // Ask for screen/tab sharing first, while the click's user activation is fresh.
+    if (src === 'system' || src === 'both') streams.push({ kind: 'sys', stream: await getSystemStream() });
+    if (src === 'mic' || src === 'both') streams.push({ kind: 'mic', stream: await getMicStream() });
+  } catch (e) {
+    streams.forEach((s) => s.stream.getTracks().forEach((t) => t.stop()));
+    showMsg(e.name === 'NotAllowedError' ? '已取消或未授权音频采集' : e.message);
+    return;
+  }
+
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  await ctx.audioWorklet.addModule('audio-worklet.js');
+  const node = new AudioWorkletNode(ctx, 'pcm-capture');
+  const sink = ctx.createGain();
+  sink.gain.value = 0;
+  node.connect(sink).connect(ctx.destination);
+
+  for (const { kind, stream } of streams) {
+    const source = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+    const gain = ctx.createGain();
+    gain.gain.value = kind === 'mic' ? settings.audio.micGain : settings.audio.sysGain;
+    source.connect(gain).connect(node);
+    stream.getAudioTracks().forEach((t) =>
+      t.addEventListener('ended', () => {
+        if (state.running) {
+          stop();
+          showMsg(kind === 'sys' ? '屏幕/标签页共享已结束' : '麦克风已断开');
+        }
+      }),
+    );
+  }
+
+  const meter = $('meterBar');
+  node.port.onmessage = (e) => {
+    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(e.data.pcm.buffer);
+    meter.style.width = `${Math.min(100, e.data.rms * 400)}%`;
+  };
+
+  state.audio = { ctx, node, streams };
+  resetLive();
+  transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
+  wsSend(asrConfig());
+  wsSend({ type: 'start' });
+  state.streamStartWall = Date.now();
+  state.running = true;
+  $('startBtn').textContent = '停止';
+  $('startBtn').classList.add('running');
+  if (src !== 'system') listMics();
+  requestWakeLock();
+}
+
+function stop() {
+  wsSend({ type: 'stop' });
+  const a = state.audio;
+  if (a) {
+    a.streams.forEach((s) => s.stream.getTracks().forEach((t) => t.stop()));
+    a.ctx.close();
+  }
+  state.audio = null;
+  state.running = false;
+  $('startBtn').textContent = '开始';
+  $('startBtn').classList.remove('running');
+  $('meterBar').style.width = '0';
+  setPill($('stVad'), '● 静音');
+  state.wakeLock?.release().catch(() => {});
+  state.wakeLock = null;
+}
+
+async function requestWakeLock() {
+  try {
+    state.wakeLock = await navigator.wakeLock?.request('screen');
+  } catch {
+    /* not critical */
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.running) requestWakeLock();
+});
+
+$('startBtn').onclick = () => (state.running ? stop() : start());
+
+$('sourceSel').value = settings.source;
+$('sourceSel').onchange = () => {
+  settings.source = $('sourceSel').value;
+  $('micSel').classList.toggle('hidden', settings.source === 'system');
+  saveSettings();
+};
+$('micSel').classList.toggle('hidden', settings.source === 'system');
+$('micSel').onchange = () => {
+  settings.micDeviceId = $('micSel').value;
+  saveSettings();
+};
+navigator.mediaDevices.addEventListener?.('devicechange', listMics);
+
+// ---------------------------------------------------------------- settings UI
+
+$('settingsBtn').onclick = () => $('settings').classList.toggle('hidden');
+$('closeSettings').onclick = () => $('settings').classList.add('hidden');
+
+document.querySelectorAll('.tab').forEach((tab) => {
+  tab.onclick = () => {
+    document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t === tab));
+    document.querySelectorAll('.pane').forEach((p) => p.classList.toggle('hidden', p.dataset.pane !== tab.dataset.tab));
+  };
+});
+
+function getPath(path) {
+  return path.split('.').reduce((o, k) => o[k], settings);
+}
+function setPath(path, value) {
+  const keys = path.split('.');
+  const last = keys.pop();
+  keys.reduce((o, k) => o[k], settings)[last] = value;
+}
+
+// Two-way bind a control to a settings path.
+function bind(id, path, onChange) {
+  const el = $(id);
+  const isCheck = el.type === 'checkbox';
+  const isNum = el.type === 'number' || el.type === 'range';
+  const show = () => (isCheck ? (el.checked = getPath(path)) : (el.value = getPath(path)));
+  show();
+  el.addEventListener(isCheck || el.tagName === 'SELECT' ? 'change' : 'input', () => {
+    let v = isCheck ? el.checked : el.value;
+    if (isNum) {
+      v = Number(v);
+      if (Number.isNaN(v)) return;
+    }
+    setPath(path, v);
+    saveSettings();
+    onChange?.(v);
+  });
+}
+
+function updateProviderFields() {
+  const claude = settings.tr.provider === 'claude';
+  $('openaiFields').classList.toggle('hidden', claude);
+  $('claudeFields').classList.toggle('hidden', !claude);
+}
+
+bind('trEnabled', 'tr.enabled');
+bind('trProvider', 'tr.provider', updateProviderFields);
+bind('oaBase', 'tr.openai.baseUrl');
+bind('oaKey', 'tr.openai.apiKey');
+bind('oaModel', 'tr.openai.model');
+bind('clKey', 'tr.claude.apiKey');
+bind('clModel', 'tr.claude.model');
+bind('clEffort', 'tr.claude.effort');
+bind('trContext', 'tr.contextSize');
+bind('locBase', 'tr.local.baseUrl');
+bind('locModel', 'tr.local.model');
+updateProviderFields();
+
+// Toggles shown both in the top bar and in settings.
+function bindToggle(ids, path, onChange) {
+  const sync = (v) => {
+    ids.forEach((id) => ($(id).checked = v));
+    onChange?.(v);
+  };
+  ids.forEach((id) => bind(id, path, sync));
+}
+
+async function warmupLocal() {
+  setPill($('stTr'), '翻译：正在加载本地模型…', 'warn');
+  try {
+    const res = await fetch('/api/translate/warmup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: settings.tr.local }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    setPill($('stTr'), `翻译：本地模型已就绪（${settings.tr.local.model}）`, 'ok');
+  } catch (e) {
+    setPill($('stTr'), '翻译：本地模型不可用', 'err');
+    showMsg(e.message);
+  }
+}
+
+bindToggle(['trLive', 'tbLive'], 'tr.live');
+bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => on && warmupLocal());
+if (settings.tr.useLocal) warmupLocal();
+
+bind('asrLang', 'asr.language', sendConfig);
+bind('vadThr', 'asr.vadThreshold', sendConfig);
+bind('vadSil', 'asr.minSilenceMs', sendConfig);
+bind('vadMax', 'asr.maxSegmentS', sendConfig);
+bind('asrGlossary', 'asr.glossaryPrompt', sendConfig);
+bind('asrPartial', 'asr.partial', sendConfig);
+
+const showGain = () => {
+  $('micGainV').textContent = `${settings.audio.micGain}×`;
+  $('sysGainV').textContent = `${settings.audio.sysGain}×`;
+};
+bind('micGain', 'audio.micGain', showGain);
+bind('sysGain', 'audio.sysGain', showGain);
+bind('micProc', 'audio.micProcessing');
+showGain();
+
+bind('showOrig', 'display.showOrig', applyDisplay);
+bind('autoScroll', 'display.autoScroll');
+bind('origSize', 'display.origSize', applyDisplay);
+bind('transSize', 'display.transSize', applyDisplay);
+
+document.querySelectorAll('[data-font]').forEach((btn) => {
+  btn.onclick = () => {
+    const key = btn.dataset.font === 'orig' ? 'origSize' : 'transSize';
+    settings.display[key] = Math.max(10, Math.min(64, settings.display[key] + Number(btn.dataset.delta)));
+    $(key).value = settings.display[key];
+    saveSettings();
+    applyDisplay();
+  };
+});
+
+$('trTest').onclick = async () => {
+  const out = $('trTestOut');
+  out.textContent = '测试中…';
+  const t0 = performance.now();
+  let first = 0;
+  try {
+    const r = await postTranslate(
+      translationRequest('Allora, nel sistema OFDM ogni subcarrier is modulated independently, quindi il cyclic prefix elimina la ISI.', []),
+      (text) => {
+        if (!first) first = performance.now() - t0;
+        out.textContent = `… ${text}`;
+      },
+    );
+    const total = Math.round(performance.now() - t0);
+    out.textContent = `✓ 首字 ${Math.round(first || total)} ms · 共 ${total} ms：${r}`;
+  } catch (e) {
+    out.textContent = `✗ ${e.message}`;
+  }
+};
+
+// ---------------------------------------------------------------- glossary UI
+
+function renderGlossary() {
+  const q = $('glSearch').value.trim().toLowerCase();
+  const body = $('glBody');
+  body.innerHTML = '';
+  let shown = 0;
+  // Newest first so freshly added rows appear at the top.
+  for (let i = glossary.length - 1; i >= 0; i--) {
+    const g = glossary[i];
+    if (q && ![g.it, g.en, g.zh].some((t) => (t || '').toLowerCase().includes(q))) continue;
+    shown++;
+    const tr = document.createElement('tr');
+    for (const k of ['it', 'en', 'zh']) {
+      const td = document.createElement('td');
+      const inp = document.createElement('input');
+      inp.value = g[k] || '';
+      inp.oninput = () => {
+        g[k] = inp.value;
+        saveGlossaryAndSync();
+      };
+      td.appendChild(inp);
+      tr.appendChild(td);
+    }
+    const td = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '✕';
+    del.title = '删除';
+    del.onclick = () => {
+      glossary.splice(glossary.indexOf(g), 1);
+      saveGlossaryAndSync();
+      renderGlossary();
+    };
+    td.appendChild(del);
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+  $('glCount').textContent = `共 ${glossary.length} 条${q ? `，匹配 ${shown} 条` : ''}`;
+}
+
+const saveGlossaryAndSync = debounce(() => {
+  saveGlossary();
+  sendConfig();
+}, 400);
+
+$('glSearch').oninput = renderGlossary;
+$('glAdd').onclick = () => {
+  glossary.push({ it: '', en: '', zh: '' });
+  $('glSearch').value = '';
+  saveGlossaryAndSync();
+  renderGlossary();
+  $('glBody').querySelector('input')?.focus();
+};
+$('glExport').onclick = () => download('glossary.json', JSON.stringify(glossary, null, 1), 'application/json');
+$('glReset').onclick = async () => {
+  if (!confirm('恢复默认术语表？你添加或修改的条目会丢失。')) return;
+  glossary = null;
+  await ensureGlossary();
+  sendConfig();
+  renderGlossary();
+};
+$('glImport').onclick = () => $('glFile').click();
+$('glFile').onchange = async () => {
+  const file = $('glFile').files[0];
+  $('glFile').value = '';
+  if (!file) return;
+  const text = await file.text();
+  let items = [];
+  try {
+    if (file.name.toLowerCase().endsWith('.json')) {
+      items = JSON.parse(text).map((x) => ({ it: x.it || '', en: x.en || '', zh: x.zh || '' }));
+    } else {
+      items = text
+        .split(/\r?\n/)
+        .map((l) => l.split(/[,\t;]/).map((x) => x.trim()))
+        .filter((c) => c.some(Boolean))
+        .map(([it = '', en = '', zh = '']) => ({ it, en, zh }));
+    }
+  } catch (e) {
+    alert(`导入失败：${e.message}`);
+    return;
+  }
+  const key = (g) => `${(g.it || '').toLowerCase()}|${(g.en || '').toLowerCase()}`;
+  const existing = new Map(glossary.map((g) => [key(g), g]));
+  let added = 0;
+  for (const it of items) {
+    const old = existing.get(key(it));
+    if (old) Object.assign(old, it);
+    else {
+      glossary.push(it);
+      added++;
+    }
+  }
+  saveGlossaryAndSync();
+  renderGlossary();
+  alert(`导入 ${items.length} 条，其中新增 ${added} 条`);
+};
+
+// ---------------------------------------------------------------- boot
+
+window.addEventListener('beforeunload', (e) => {
+  if (state.running) e.preventDefault();
+});
+
+(async function boot() {
+  applyDisplay();
+  await ensureGlossary();
+  renderGlossary();
+  await initSessions();
+  await listMics();
+  connectWs();
+})();
