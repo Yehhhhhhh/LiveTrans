@@ -1,12 +1,12 @@
 # LiveTrans 同传字幕
 
-课堂实时字幕：意大利语 / 英语混合语音 → 本地 Whisper 识别 → API 翻译成中文，在 Chrome 中显示。
+课堂实时字幕：意大利语 / 英语混合语音 → 本地 Whisper 识别 → 云端 API 或本地 Ollama 模型翻译成中文，在 Chrome 中显示。
 
 ## 特性
 
 - 本地 GPU 运行 faster-whisper（`large-v3-turbo`），意大利语 / 英语逐段自动识别
 - Silero VAD 流式断句，说话时逐词实时显示，句末替换为精确结果
-- 翻译支持 OpenAI 兼容接口与 Claude，带上下文与术语表
+- 翻译支持 OpenAI 兼容接口、Claude，以及本机 Ollama 本地模型（不经过云端），带上下文与术语表，流式输出
 - 音源支持麦克风、系统 / 标签页音频，无需虚拟声卡
 - 记录自动保存在浏览器，可导出 Markdown
 - 内置 225 条通信领域意 / 英 / 中术语表
@@ -17,7 +17,7 @@
 - Python 3.12
 - NVIDIA 显卡 + 驱动（无显卡可用 CPU，但很慢）
 - Chrome / Edge 浏览器
-- 一个翻译 API（OpenAI 兼容接口或 Claude）
+- 翻译二选一：云端 API（OpenAI 兼容接口或 Claude），或本机安装 [Ollama](https://ollama.com/download) 使用本地模型
 
 ## 安装与启动
 
@@ -25,7 +25,7 @@
 2. 双击 `start.bat`：启动后端并打开 http://127.0.0.1:8765 。
    首次启动会下载 Whisper `large-v3-turbo` 模型（约 1.6GB），状态栏显示「模型：large-v3-turbo · cuda/float16」即就绪。
    下载困难时，编辑 `start.bat`，取消 `HF_ENDPOINT` 那行的注释使用镜像。
-3. 在「设置 → 翻译」中填写 API，点「测试翻译」确认可用。
+3. 在「设置 → 翻译」中填写 API，或开启「本地模型」（见下文），点「测试翻译」确认可用。
 
 ## 音源
 
@@ -41,8 +41,32 @@
 
 - **OpenAI 兼容接口**：OpenAI、DeepSeek、通义千问、Ollama / LM Studio 等任何 `/chat/completions` 接口。
 - **Claude**：默认 `claude-opus-5-5`，effort 设为 `low` 以降低延迟；想更快更省可改为 `claude-haiku-5-5`。
+- **本地模型（Ollama）**：见下一节，开启后忽略上面的服务商。
+- 译文流式显示，边生成边出现。
+- **提前翻译**（顶栏开关）：说话过程中就翻译实时识别出的半句话，译文更早出现；需开启「逐词实时显示」，API 调用次数会增加数倍。
 - 每段翻译会带上前 N 段（默认 3）的原文和译文作上下文，并附上该段命中的术语表条目。
 - 翻译失败的段落可点「翻译」重试，已翻译的可点「重译」。
+
+## 本地翻译（Ollama）
+
+翻译完全在本机运行，不需要 API Key，也不经过云端。
+
+1. 安装 [Ollama](https://ollama.com/download) 并保持运行。
+2. 拉取模型（默认推荐，约 2.5GB，显存占用约 3GB）：
+   ```
+   ollama pull qwen3:4b-instruct-2507-q4_K_M
+   ```
+3. 在顶栏勾选「本地模型」，或在「设置 → 翻译」中勾选「使用本地模型」。
+   默认地址 `http://127.0.0.1:11434`，模型名可改成任何已拉取的 Ollama 模型。
+4. 开启时会自动预加载模型，状态栏显示「翻译：本地模型已就绪」即可使用。
+
+说明：
+
+- 模型常驻显存 1 小时（`keep_alive`），避免第一句翻译变慢；上下文窗口为 4096，给 Whisper 留出显存。
+- 显存要和 Whisper 共用：`large-v3-turbo` 约占 4GB，8GB 显卡上本地模型建议控制在 3.5GB 以内，否则会互相抢显存变慢。
+- 自动关闭模型的思考模式；推理模型输出的 `<think>` 内容会被过滤掉。
+- 本地 4B 模型翻译质量不如云端大模型，专业术语主要靠术语表纠正。
+- 常见错误：「无法连接 Ollama」→ 确认 Ollama 已启动；「本地没有模型 …」→ 先执行上面的 `ollama pull`。
 
 ## 识别参数（设置 → 识别）
 
@@ -76,7 +100,7 @@ backend/requirements.txt  Python 依赖
 backend/server.py      FastAPI：/ws 音频流、/api/translate 翻译代理、静态页面
 backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（意/英二选一）
-backend/translate.py   OpenAI 兼容接口 / Claude
+backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
 frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB 记录
 install.bat            创建 .venv 并安装依赖
 start.bat              启动后端并打开页面
