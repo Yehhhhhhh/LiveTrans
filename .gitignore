@@ -16,3 +16,6 @@ Thumbs.db
 # Local env
 .env
 *.log
+
+# Debug audio recordings (LIVETRANS_RECORD=1)
+recordings/

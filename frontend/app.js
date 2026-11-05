@@ -7,7 +7,8 @@ const $ = (id) => document.getElementById(id);
 const DEFAULTS = {
   source: 'mic',
   micDeviceId: '',
-  audio: { micGain: 1, sysGain: 1, micProcessing: true },
+  // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
+  audio: { micGain: 1, sysGain: 1, micProcessing: false },
   asr: { language: 'auto', vadThreshold: 0.5, minSilenceMs: 600, maxSegmentS: 8, glossaryPrompt: true, partial: true },
   tr: {
     enabled: true,
@@ -78,6 +79,17 @@ const state = {
 function setPill(el, text, cls = '') {
   el.textContent = text;
   el.className = 'pill' + (cls ? ' ' + cls : '');
+}
+
+// Live speech probability next to the threshold, so the threshold can be set just below the speaker.
+function showVad(msg) {
+  const el = $('stVad');
+  let text = msg.speaking ? '● 说话中' : '● 静音';
+  if (typeof msg.prob === 'number') {
+    text += ` 人声 ${msg.prob.toFixed(2)} / 阈值 ${Number(settings.asr.vadThreshold).toFixed(2)}`;
+  }
+  setPill(el, text, msg.speaking ? 'speaking' : '');
+  el.title = '人声概率高于阈值才会开始识别。老师说话时人声值总低于阈值，就把「语音判定阈值」调低一些。';
 }
 
 function showMsg(text) {
@@ -210,7 +222,7 @@ function connectWs() {
       return;
     }
     if (msg.type === 'status') onStatus(msg);
-    else if (msg.type === 'vad') setPill($('stVad'), msg.speaking ? '● 说话中' : '● 静音', msg.speaking ? 'speaking' : '');
+    else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);
     else if (msg.type === 'partial') {
       renderPartial(msg.index, msg.text);

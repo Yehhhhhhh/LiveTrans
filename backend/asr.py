@@ -22,6 +22,93 @@ HALLUCINATIONS = re.compile(
     re.I,
 )
 
+# Whole outputs Whisper produces on noise / silence (outro-subtitle habits). Matched against
+# the entire segment text, after repeats are collapsed, so real sentences containing them survive.
+STOCK_PHRASES = re.compile(
+    r"^(grazie( a tutti| mille| ancora| a voi)?|thank you( (very much|all|everyone|so much))?|thanks"
+    r"|ciao( a tutti)?|bye( bye)?|wtf|you|buona (visione|serata|giornata)|alla prossima)$",
+    re.I,
+)
+
+# The fixed header app.js puts before the glossary terms.
+PROMPT_HEADER_WORDS = {"lezione", "di", "telecomunicazioni", "telecommunications", "lecture"}
+# Ignored when deciding whether an output only echoes the prompt.
+FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
+_CLAUSE = re.compile(r"[.,;:!?…]+")
+
+_WORD = re.compile(r"[\w']+", re.U)
+
+
+def _norm(token: str) -> str:
+    return " ".join(_WORD.findall(token.lower()))
+
+
+def collapse_repeats(text: str) -> str:
+    """Collapse Whisper repeat loops to one copy: a word or phrase repeated 3+ times
+    ("ruota, ruota, ruota" -> "ruota,"), or a sentence of 8+ words repeated 2+ times.
+    A truncated copy of the unit trailing the loop is dropped too."""
+    tokens = text.split()
+    norm = [_norm(t) for t in tokens]
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        best_n, best_count = 0, 1
+        for n in range(1, (len(tokens) - i) // 2 + 1):
+            min_repeats = 2 if n >= 8 else 3
+            if i + n * min_repeats > len(tokens):
+                continue
+            unit = norm[i : i + n]
+            if not any(unit):
+                continue
+            count = 1
+            while norm[i + count * n : i + (count + 1) * n] == unit:
+                count += 1
+            if count >= min_repeats and count * n > best_count * best_n:
+                best_n, best_count = n, count
+        if best_n:
+            out.extend(tokens[i : i + best_n])
+            i += best_n * best_count
+            # A partial result often ends mid-way through yet another copy.
+            unit = norm[i - best_n : i]
+            tail = 0
+            while tail < best_n and i + tail < len(norm) and norm[i + tail] == unit[tail]:
+                tail += 1
+            if tail >= 2 and i + tail == len(norm):
+                i += tail
+        else:
+            out.append(tokens[i])
+            i += 1
+    return " ".join(out)
+
+
+def prompt_words(prompt: str) -> set[str]:
+    return set(_WORD.findall(prompt.lower())) - PROMPT_HEADER_WORDS if prompt else set()
+
+
+def clean_text(text: str, prompt: str = "") -> str:
+    """Return the text with repeat loops collapsed, or "" if it looks like a hallucination."""
+    raw = text.strip()
+    text = collapse_repeats(raw)
+    if not text or HALLUCINATIONS.search(text):
+        return ""
+    words = _WORD.findall(text.lower())
+    # A loop of one or two filler words ("e e e e", "si si si") has nothing worth showing.
+    if len(words) <= 2 and text != raw:
+        return ""
+    # Every clause a stock phrase ("Grazie, grazie.", "Grazie. Grazie a tutti.").
+    clauses = [" ".join(_WORD.findall(c)) for c in _CLAUSE.split(text.lower())]
+    if all(STOCK_PHRASES.match(c) for c in clauses if c):
+        return ""
+    # Echo of the glossary prompt: content words that all come from the prompt (or its header)
+    # are Whisper reciting its prompt, not the lecturer speaking.
+    content = [w for w in words if w not in FUNCTION_WORDS]
+    vocab = prompt_words(prompt)
+    if prompt and content and all(w in PROMPT_HEADER_WORDS for w in content):
+        return ""
+    if vocab and len(content) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in content):
+        return ""
+    return text
+
 
 def setup_cuda_dlls() -> None:
     """Make the pip-installed CUDA/cuDNN DLLs (nvidia-*-cu12) loadable on Windows."""
@@ -99,10 +186,9 @@ class Transcriber:
             without_timestamps=True,
             initial_prompt=prompt or None,
         )
-        text = " ".join(s.text.strip() for s in segments if s.text.strip())
+        text = clean_text(" ".join(s.text.strip() for s in segments if s.text.strip()), prompt)
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
-        text = re.sub(r"[.…]+$", "", text).strip()
-        return "" if HALLUCINATIONS.search(text) else text
+        return re.sub(r"[.…]+$", "", text).strip()
 
     def transcribe(self, audio: np.ndarray, language: str = "auto", prompt: str = "") -> dict:
         t0 = time.time()
@@ -124,14 +210,18 @@ class Transcriber:
         )
         parts = []
         for s in segments:
-            if s.no_speech_prob > 0.6 and s.avg_logprob < -1.0:
+            # Even after temperature fallback Whisper returns its last attempt; reject it here
+            # if it is still a repeat loop, very unsure, or probably not speech at all.
+            if s.compression_ratio > 2.4 or s.avg_logprob < -1.0:
                 continue
-            text = s.text.strip()
-            if text and not HALLUCINATIONS.search(text):
+            if s.no_speech_prob > 0.5 and s.avg_logprob < -0.5:
+                continue
+            text = clean_text(s.text, prompt)
+            if text:
                 parts.append(text)
         return {
             "lang": lang,
             "lang_prob": round(lang_prob, 3),
-            "text": " ".join(parts),
+            "text": clean_text(" ".join(parts), prompt),
             "asr_ms": int((time.time() - t0) * 1000),
         }
