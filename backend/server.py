@@ -333,5 +333,24 @@ class NoCacheStaticFiles(StaticFiles):
 app.mount("/", NoCacheStaticFiles(directory=FRONTEND, html=True), name="frontend")
 
 
+def open_browser_when_ready(server: uvicorn.Server) -> None:
+    """Open the frontend only once uvicorn is actually accepting connections."""
+
+    def run() -> None:
+        while not server.started:
+            if server.should_exit:
+                return
+            time.sleep(0.1)
+        import webbrowser
+
+        webbrowser.open(f"http://127.0.0.1:{PORT}")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT, log_level="warning"))
+    # start.bat sets LIVETRANS_OPEN_BROWSER=1 so double-clicking it opens the page once the server is up.
+    if os.environ.get("LIVETRANS_OPEN_BROWSER", "") == "1":
+        open_browser_when_ready(server)
+    server.run()

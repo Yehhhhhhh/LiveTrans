@@ -20,6 +20,6 @@ rem set LIVETRANS_RECORD=1
 
 set PYTHONIOENCODING=utf-8
 set HF_HUB_DISABLE_SYMLINKS_WARNING=1
-start "" http://127.0.0.1:8765
+set LIVETRANS_OPEN_BROWSER=1
 .venv\Scripts\python backend\server.py
 pause
