@@ -32,6 +32,9 @@ STOCK_PHRASES = re.compile(
 
 # The fixed header app.js puts before the glossary terms.
 PROMPT_HEADER_WORDS = {"lezione", "di", "telecomunicazioni", "telecommunications", "lecture"}
+# Ignored when deciding whether an output only echoes the prompt.
+FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
+_CLAUSE = re.compile(r"[.,;:!?…]+")
 
 _WORD = re.compile(r"[\w']+", re.U)
 
@@ -40,18 +43,20 @@ def _norm(token: str) -> str:
     return " ".join(_WORD.findall(token.lower()))
 
 
-def collapse_repeats(text: str, min_repeats: int = 3, max_unit: int = 6) -> str:
-    """Collapse a word or short phrase repeated >= min_repeats times in a row to one copy
-    ("ruota, ruota, ruota, ruota" -> "ruota,")."""
+def collapse_repeats(text: str) -> str:
+    """Collapse Whisper repeat loops to one copy: a word or phrase repeated 3+ times
+    ("ruota, ruota, ruota" -> "ruota,"), or a sentence of 8+ words repeated 2+ times.
+    A truncated copy of the unit trailing the loop is dropped too."""
     tokens = text.split()
     norm = [_norm(t) for t in tokens]
     out: list[str] = []
     i = 0
     while i < len(tokens):
         best_n, best_count = 0, 1
-        for n in range(1, max_unit + 1):
+        for n in range(1, (len(tokens) - i) // 2 + 1):
+            min_repeats = 2 if n >= 8 else 3
             if i + n * min_repeats > len(tokens):
-                break
+                continue
             unit = norm[i : i + n]
             if not any(unit):
                 continue
@@ -63,6 +68,13 @@ def collapse_repeats(text: str, min_repeats: int = 3, max_unit: int = 6) -> str:
         if best_n:
             out.extend(tokens[i : i + best_n])
             i += best_n * best_count
+            # A partial result often ends mid-way through yet another copy.
+            unit = norm[i - best_n : i]
+            tail = 0
+            while tail < best_n and i + tail < len(norm) and norm[i + tail] == unit[tail]:
+                tail += 1
+            if tail >= 2 and i + tail == len(norm):
+                i += tail
         else:
             out.append(tokens[i])
             i += 1
@@ -75,18 +87,25 @@ def prompt_words(prompt: str) -> set[str]:
 
 def clean_text(text: str, prompt: str = "") -> str:
     """Return the text with repeat loops collapsed, or "" if it looks like a hallucination."""
-    text = collapse_repeats(text.strip())
+    raw = text.strip()
+    text = collapse_repeats(raw)
     if not text or HALLUCINATIONS.search(text):
         return ""
     words = _WORD.findall(text.lower())
-    if not words or STOCK_PHRASES.match(" ".join(words)):
+    # A loop of one or two filler words ("e e e e", "si si si") has nothing worth showing.
+    if len(words) <= 2 and text != raw:
         return ""
-    # Echo of the glossary prompt: a bare list of 3+ words that all come from the prompt
-    # (or the prompt's header) is Whisper reciting its prompt, not the lecturer speaking.
+    # Every clause a stock phrase ("Grazie, grazie.", "Grazie. Grazie a tutti.").
+    clauses = [" ".join(_WORD.findall(c)) for c in _CLAUSE.split(text.lower())]
+    if all(STOCK_PHRASES.match(c) for c in clauses if c):
+        return ""
+    # Echo of the glossary prompt: content words that all come from the prompt (or its header)
+    # are Whisper reciting its prompt, not the lecturer speaking.
+    content = [w for w in words if w not in FUNCTION_WORDS]
     vocab = prompt_words(prompt)
-    if vocab and len(words) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in words):
+    if prompt and content and all(w in PROMPT_HEADER_WORDS for w in content):
         return ""
-    if prompt and all(w in PROMPT_HEADER_WORDS for w in words):
+    if vocab and len(content) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in content):
         return ""
     return text
 

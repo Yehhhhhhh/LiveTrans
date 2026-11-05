@@ -78,6 +78,9 @@ class SegmenterParams:
     agc_target_rms: float = 0.05
     agc_max_gain: float = 20.0
     agc_release_s: float = 4.0  # half-life of the tracked level
+    # Silero's recurrent state drifts on long unbroken classroom audio until it stops
+    # detecting speech at all; reset it at segment boundaries and at least this often.
+    vad_reset_s: float = 10.0
 
 
 @dataclass
@@ -99,6 +102,7 @@ class Segmenter:
         self.peak_prob = 0.0  # highest speech probability since take_peak_prob(), for the UI
         self.pending = np.zeros(0, dtype=np.float32)
         self.frames_seen = 0
+        self.frames_since_reset = 0
         self.preroll: deque[np.ndarray] = deque(maxlen=max(1, round(self.params.pre_roll_ms / FRAME_MS)))
         self.in_speech = False
         self.seg_frames: list[np.ndarray] = []
@@ -146,6 +150,12 @@ class Segmenter:
 
     def _step(self, frame: np.ndarray) -> Segment | None:
         p = self.params
+        # Reset while silent once the state is old; mid-speech only as a failsafe for long segments
+        # (segment boundaries reset it too, see _emit).
+        age_ms = self.frames_since_reset * FRAME_MS
+        if age_ms >= p.vad_reset_s * 1000 * (2 if self.in_speech else 1):
+            self._reset_vad()
+        self.frames_since_reset += 1
         prob = self.vad.prob(self._agc(frame))
         self.peak_prob = max(self.peak_prob, prob)
         self.frames_seen += 1
@@ -198,8 +208,14 @@ class Segmenter:
         gain = min(p.agc_max_gain, max(1.0, p.agc_target_rms / max(self.level, 1e-6)))
         return frame if gain == 1.0 else np.clip(frame * gain, -1.0, 1.0)
 
+    def _reset_vad(self) -> None:
+        self.vad.reset()
+        self.frames_since_reset = 0
+
     def _emit(self) -> Segment | None:
         p = self.params
+        if self.frames_since_reset * FRAME_MS >= 2000:  # a fresh state needs a moment to warm up
+            self._reset_vad()
         frames = self.seg_frames
         keep_tail = round(p.keep_tail_ms / FRAME_MS)
         drop = max(0, self.silence_frames - keep_tail)
