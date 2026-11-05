@@ -96,6 +96,18 @@ function showMsg(text) {
   $('stMsg').textContent = text || '';
 }
 
+// A translation-backend problem (e.g. Ollama not running) is shown until the
+// backend works again or another backend is chosen; other messages are kept.
+let trMsg = '';
+function showTrMsg(text) {
+  trMsg = text;
+  showMsg(text);
+}
+function clearTrMsg() {
+  if (trMsg && $('stMsg').textContent === trMsg) showMsg('');
+  trMsg = '';
+}
+
 const pad = (n) => String(n).padStart(2, '0');
 function fmtTime(ts) {
   const d = new Date(ts);
@@ -400,6 +412,7 @@ async function translateSeg(seg) {
       seg.translation = await postTranslate(translationRequest(seg.text, await contextFor(seg)), onText);
     }
     seg.trStatus = 'done';
+    clearTrMsg();
     const total = Math.round(performance.now() - t0);
     setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms · 队列 ${state.trQueue.length}`, 'ok');
   } catch (e) {
@@ -982,15 +995,22 @@ async function warmupLocal() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    if (!settings.tr.useLocal) return; // Switched away while loading.
     setPill($('stTr'), `翻译：本地模型已就绪（${settings.tr.local.model}）`, 'ok');
+    clearTrMsg();
   } catch (e) {
+    if (!settings.tr.useLocal) return;
     setPill($('stTr'), '翻译：本地模型不可用', 'err');
-    showMsg(e.message);
+    showTrMsg(e.message);
   }
 }
 
 bindToggle(['trLive', 'tbLive'], 'tr.live');
-bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => on && warmupLocal());
+bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => {
+  if (on) return warmupLocal();
+  clearTrMsg();
+  setPill($('stTr'), '翻译：-');
+});
 if (settings.tr.useLocal) warmupLocal();
 
 bind('asrLang', 'asr.language', sendConfig);
