@@ -1,26 +1,27 @@
 @echo off
-chcp 65001 >nul
+rem NOTE: keep this file pure ASCII with CRLF line endings. cmd.exe misparses
+rem UTF-8 multibyte text in .bat files (runs fragments of comments as commands).
 cd /d "%~dp0"
 
-echo [LiveTrans] 创建 Python 虚拟环境 .venv ...
+echo [LiveTrans] Creating Python virtual environment .venv ...
 if not exist .venv (
     py -3.12 -m venv .venv 2>nul || python -m venv .venv
 )
 if not exist .venv\Scripts\python.exe (
-    echo 创建虚拟环境失败，请确认已安装 Python 3.12
+    echo [LiveTrans] Failed to create the virtual environment. Make sure Python 3.12 is installed.
     pause
     exit /b 1
 )
 
-echo [LiveTrans] 安装依赖（含 CUDA/cuDNN 运行库，约 1.5GB）...
+echo [LiveTrans] Installing dependencies (incl. CUDA/cuDNN runtime, about 1.5GB) ...
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r backend\requirements.txt
 if errorlevel 1 (
-    echo 依赖安装失败
+    echo [LiveTrans] Dependency installation failed.
     pause
     exit /b 1
 )
 
 echo.
-echo 安装完成。运行 start.bat 启动（首次启动会下载约 1.6GB 的 Whisper 模型）。
+echo [LiveTrans] Done. Run start.bat to launch (first launch downloads the ~1.6GB Whisper model).
 pause

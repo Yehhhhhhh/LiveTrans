@@ -1,21 +1,23 @@
 @echo off
 chcp 65001 >nul
+rem NOTE: keep this file pure ASCII with CRLF line endings. cmd.exe misparses
+rem UTF-8 multibyte text in .bat files (runs fragments of comments as commands).
 cd /d "%~dp0"
 
 if not exist .venv\Scripts\python.exe (
-    echo 请先运行 install.bat
+    echo [LiveTrans] .venv not found. Please run install.bat first.
     pause
     exit /b 1
 )
 
-rem 访问 HuggingFace 困难时取消下一行注释使用镜像
+rem Mainland China: uncomment to download models via the HuggingFace mirror
 rem set HF_ENDPOINT=https://hf-mirror.com
 
-rem 可选：更换模型（如 large-v3 / medium）或端口
+rem Optional: change model (e.g. large-v3 / medium) or port
 rem set LIVETRANS_MODEL=large-v3-turbo
 rem set LIVETRANS_PORT=8765
 
-rem 可选：把每次采集的原始音频保存到 recordings\ 目录，用于排查识别问题
+rem Optional: save each session's raw audio to recordings\ (for debugging)
 rem set LIVETRANS_RECORD=1
 
 set PYTHONIOENCODING=utf-8
