@@ -22,6 +22,74 @@ HALLUCINATIONS = re.compile(
     re.I,
 )
 
+# Whole outputs Whisper produces on noise / silence (outro-subtitle habits). Matched against
+# the entire segment text, after repeats are collapsed, so real sentences containing them survive.
+STOCK_PHRASES = re.compile(
+    r"^(grazie( a tutti| mille| ancora| a voi)?|thank you( (very much|all|everyone|so much))?|thanks"
+    r"|ciao( a tutti)?|bye( bye)?|wtf|you|buona (visione|serata|giornata)|alla prossima)$",
+    re.I,
+)
+
+# The fixed header app.js puts before the glossary terms.
+PROMPT_HEADER_WORDS = {"lezione", "di", "telecomunicazioni", "telecommunications", "lecture"}
+
+_WORD = re.compile(r"[\w']+", re.U)
+
+
+def _norm(token: str) -> str:
+    return " ".join(_WORD.findall(token.lower()))
+
+
+def collapse_repeats(text: str, min_repeats: int = 3, max_unit: int = 6) -> str:
+    """Collapse a word or short phrase repeated >= min_repeats times in a row to one copy
+    ("ruota, ruota, ruota, ruota" -> "ruota,")."""
+    tokens = text.split()
+    norm = [_norm(t) for t in tokens]
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        best_n, best_count = 0, 1
+        for n in range(1, max_unit + 1):
+            if i + n * min_repeats > len(tokens):
+                break
+            unit = norm[i : i + n]
+            if not any(unit):
+                continue
+            count = 1
+            while norm[i + count * n : i + (count + 1) * n] == unit:
+                count += 1
+            if count >= min_repeats and count * n > best_count * best_n:
+                best_n, best_count = n, count
+        if best_n:
+            out.extend(tokens[i : i + best_n])
+            i += best_n * best_count
+        else:
+            out.append(tokens[i])
+            i += 1
+    return " ".join(out)
+
+
+def prompt_words(prompt: str) -> set[str]:
+    return set(_WORD.findall(prompt.lower())) - PROMPT_HEADER_WORDS if prompt else set()
+
+
+def clean_text(text: str, prompt: str = "") -> str:
+    """Return the text with repeat loops collapsed, or "" if it looks like a hallucination."""
+    text = collapse_repeats(text.strip())
+    if not text or HALLUCINATIONS.search(text):
+        return ""
+    words = _WORD.findall(text.lower())
+    if not words or STOCK_PHRASES.match(" ".join(words)):
+        return ""
+    # Echo of the glossary prompt: a bare list of 3+ words that all come from the prompt
+    # (or the prompt's header) is Whisper reciting its prompt, not the lecturer speaking.
+    vocab = prompt_words(prompt)
+    if vocab and len(words) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in words):
+        return ""
+    if prompt and all(w in PROMPT_HEADER_WORDS for w in words):
+        return ""
+    return text
+
 
 def setup_cuda_dlls() -> None:
     """Make the pip-installed CUDA/cuDNN DLLs (nvidia-*-cu12) loadable on Windows."""
@@ -99,10 +167,9 @@ class Transcriber:
             without_timestamps=True,
             initial_prompt=prompt or None,
         )
-        text = " ".join(s.text.strip() for s in segments if s.text.strip())
+        text = clean_text(" ".join(s.text.strip() for s in segments if s.text.strip()), prompt)
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
-        text = re.sub(r"[.…]+$", "", text).strip()
-        return "" if HALLUCINATIONS.search(text) else text
+        return re.sub(r"[.…]+$", "", text).strip()
 
     def transcribe(self, audio: np.ndarray, language: str = "auto", prompt: str = "") -> dict:
         t0 = time.time()
@@ -124,14 +191,18 @@ class Transcriber:
         )
         parts = []
         for s in segments:
-            if s.no_speech_prob > 0.6 and s.avg_logprob < -1.0:
+            # Even after temperature fallback Whisper returns its last attempt; reject it here
+            # if it is still a repeat loop, very unsure, or probably not speech at all.
+            if s.compression_ratio > 2.4 or s.avg_logprob < -1.0:
                 continue
-            text = s.text.strip()
-            if text and not HALLUCINATIONS.search(text):
+            if s.no_speech_prob > 0.5 and s.avg_logprob < -0.5:
+                continue
+            text = clean_text(s.text, prompt)
+            if text:
                 parts.append(text)
         return {
             "lang": lang,
             "lang_prob": round(lang_prob, 3),
-            "text": " ".join(parts),
+            "text": clean_text(" ".join(parts), prompt),
             "asr_ms": int((time.time() - t0) * 1000),
         }

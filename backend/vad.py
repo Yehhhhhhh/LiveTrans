@@ -66,7 +66,8 @@ class SegmenterParams:
     min_silence_ms: int = 600
     max_segment_s: float = 8.0
     pre_roll_ms: int = 300
-    min_speech_ms: int = 250
+    # Short bursts (coughs, clicks, chairs) are where Whisper hallucinates most.
+    min_speech_ms: int = 400
     # After soft_ratio * max_segment_s, a shorter pause is enough to cut.
     soft_ratio: float = 0.6
     soft_silence_ms: int = 200
