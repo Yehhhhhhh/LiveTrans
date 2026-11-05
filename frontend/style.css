@@ -164,3 +164,7 @@ body.hide-orig .seg .orig { display: none; }
 .gl-table td input:focus { outline: 1px solid var(--accent); }
 .gl-table td:last-child { width: 32px; }
 .gl-table .del { border: none; color: var(--danger); background: transparent; padding: 0 6px; }
+
+/* KaTeX math inside translations */
+.trans .katex { font-size: 1.05em; }
+.trans .katex-display { margin: 0.3em 0; overflow-x: auto; overflow-y: hidden; }

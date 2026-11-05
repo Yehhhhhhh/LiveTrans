@@ -559,6 +559,35 @@ function renderPartial(index, text) {
   if (settings.display.autoScroll && stickToBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
+// Translations may contain LaTeX: \(...\) / $...$ inline, \[...\] / $$...$$ display.
+// Math is rendered with KaTeX; everything else stays plain text (never parsed as HTML).
+// An unclosed delimiter (e.g. mid-stream) is left as-is until its closing half arrives.
+const MATH_RE = /\\\((.+?)\\\)|\\\[([\s\S]+?)\\\]|\$\$([\s\S]+?)\$\$|\$(?!\s)([^$\n]+?)(?<!\s)\$/g;
+
+function setRichText(el, text) {
+  text = text || '';
+  if (!window.katex || !/\\[([]|\$/.test(text)) {
+    el.textContent = text;
+    return;
+  }
+  el.textContent = '';
+  let last = 0;
+  for (const m of text.matchAll(MATH_RE)) {
+    if (m.index > last) el.append(text.slice(last, m.index));
+    const display = m[2] !== undefined || m[3] !== undefined;
+    const tex = m[1] ?? m[2] ?? m[3] ?? m[4];
+    const span = document.createElement('span');
+    try {
+      katex.render(tex, span, { displayMode: display, throwOnError: false, output: 'html' });
+    } catch {
+      span.textContent = m[0];
+    }
+    el.append(span);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) el.append(text.slice(last));
+}
+
 function renderLiveTrans(index, text) {
   const el = partialEl(index);
   if (!el) return;
@@ -568,7 +597,7 @@ function renderLiveTrans(index, text) {
     tr.className = 'trans draft';
     el.appendChild(tr);
   }
-  tr.textContent = text;
+  setRichText(tr, text);
   if (settings.display.autoScroll && stickToBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -594,12 +623,12 @@ function renderSeg(seg, replace = null, after = null) {
 
   const tr = el.querySelector('.trans');
   tr.className = 'trans';
-  if (seg.trStatus === 'done') tr.textContent = seg.translation;
+  if (seg.trStatus === 'done') setRichText(tr, seg.translation);
   else if (seg.trStatus === 'streaming') {
-    tr.textContent = seg.translation;
+    setRichText(tr, seg.translation);
     tr.classList.add('streaming');
   } else if (seg.trStatus === 'pending' && drafts.has(seg.id)) {
-    tr.textContent = drafts.get(seg.id);
+    setRichText(tr, drafts.get(seg.id));
     tr.classList.add('draft');
   } else if (seg.trStatus === 'pending') {
     tr.textContent = '翻译中…';
