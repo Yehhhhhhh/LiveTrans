@@ -15,6 +15,9 @@ rem 可选：更换模型（如 large-v3 / medium）或端口
 rem set LIVETRANS_MODEL=large-v3-turbo
 rem set LIVETRANS_PORT=8765
 
+rem 可选：把每次采集的原始音频保存到 recordings\ 目录，用于排查识别问题
+rem set LIVETRANS_RECORD=1
+
 set PYTHONIOENCODING=utf-8
 set HF_HUB_DISABLE_SYMLINKS_WARNING=1
 start "" http://127.0.0.1:8765

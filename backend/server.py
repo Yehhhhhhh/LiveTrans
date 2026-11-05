@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import threading
+import time
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,6 +34,9 @@ PORT = int(os.environ.get("LIVETRANS_PORT", "8765"))
 MODEL = os.environ.get("LIVETRANS_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("LIVETRANS_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
+# Set LIVETRANS_RECORD=1 to save each capture's raw 16 kHz audio to recordings/ (for tuning).
+RECORD = os.environ.get("LIVETRANS_RECORD", "") == "1"
+RECORDINGS = ROOT / "recordings"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 for noisy in ("httpx", "httpx2", "httpcore", "huggingface_hub"):
@@ -164,6 +169,19 @@ PARTIAL_INTERVAL_S = 0.6
 PARTIAL_MIN_AUDIO_S = 0.8
 # Below this length, language detection is unreliable, so it isn't cached yet.
 PARTIAL_LANG_LOCK_S = 2.0
+# How often the live speech probability is sent to the status bar.
+VAD_LEVEL_INTERVAL_S = 0.25
+
+
+def open_recording() -> wave.Wave_write:
+    RECORDINGS.mkdir(exist_ok=True)
+    path = RECORDINGS / time.strftime("%Y%m%d-%H%M%S.wav")
+    w = wave.open(str(path), "wb")
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(16000)
+    log.info("Recording raw audio to %s", path)
+    return w
 
 
 @app.websocket("/ws")
@@ -244,19 +262,34 @@ async def ws_audio(ws: WebSocket) -> None:
 
     task = asyncio.create_task(worker())
     speaking = False
+    last_level = 0.0
+    rec: list[wave.Wave_write | None] = [None]
+
+    def close_recording() -> None:
+        if rec[0] is not None:
+            rec[0].close()
+            rec[0] = None
     try:
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("bytes") is not None:
+                if RECORD:
+                    if rec[0] is None:
+                        rec[0] = open_recording()
+                    rec[0].writeframes(msg["bytes"])
                 for s in seg.feed(msg["bytes"]):
                     queue.put_nowait(s)
                 for index in seg.take_dropped():
                     await ws.send_json({"type": "partial_drop", "index": index})
-                if seg.speaking != speaking:
+                now = time.monotonic()
+                if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
                     speaking = seg.speaking
-                    await ws.send_json({"type": "vad", "speaking": speaking})
+                    last_level = now
+                    await ws.send_json(
+                        {"type": "vad", "speaking": speaking, "prob": round(seg.take_peak_prob(), 2)}
+                    )
                 maybe_partial()
             elif msg.get("text"):
                 data = json.loads(msg["text"])
@@ -273,6 +306,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                 elif kind == "stop":
+                    close_recording()
                     for s in seg.flush():
                         queue.put_nowait(s)
                     for index in seg.take_dropped():
@@ -282,6 +316,7 @@ async def ws_audio(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        close_recording()
         clients.discard(ws)
         task.cancel()
 
