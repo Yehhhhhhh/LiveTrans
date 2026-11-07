@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from asr import Transcriber  # noqa: E402
+from asr import IT_EN, Transcriber, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
 from vad import Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
@@ -95,6 +95,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/api/languages")
+async def api_languages() -> dict:
+    """Language codes the recognition-language setting may choose from ("其他")."""
+    return {"languages": list(all_languages())}
 
 
 @app.get("/api/status")
@@ -201,7 +207,7 @@ async def ws_audio(ws: WebSocket) -> None:
     await ws.send_json(status_message())
 
     seg = Segmenter(vad_model, SegmenterParams())
-    opts = {"language": "auto", "prompt": "", "partial": True}
+    opts = {"language": IT_EN, "prompt": "", "partial": True}
     queue: asyncio.Queue = asyncio.Queue()
     live = {"busy": False, "last_frame": 0, "final_sent": 0, "lang_index": 0, "lang": ""}
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
@@ -233,11 +239,11 @@ async def ws_audio(ws: WebSocket) -> None:
 
     def partial_job(audio, index: int) -> str:
         lang = opts["language"]
-        if lang not in ("it", "en"):
+        if not is_fixed(lang):
             if live["lang_index"] == index and live["lang"]:
                 lang = live["lang"]
             else:
-                lang, _ = transcriber.pick_language(audio)
+                lang, _ = transcriber.pick_language(audio, detect_among(lang))
                 if len(audio) >= PARTIAL_LANG_LOCK_S * 16000:
                     live["lang_index"], live["lang"] = index, lang
         return transcriber.transcribe_partial(audio, lang, opts["prompt"])
@@ -307,8 +313,9 @@ async def ws_audio(ws: WebSocket) -> None:
                 if kind == "config":
                     asr = data.get("asr") or {}
                     apply_config(seg, asr)
-                    if asr.get("language") in ("auto", "it", "en"):
-                        opts["language"] = asr["language"]
+                    mode = normalize_language(asr.get("language"))
+                    if mode:
+                        opts["language"] = mode
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]

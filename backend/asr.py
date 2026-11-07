@@ -1,4 +1,4 @@
-"""faster-whisper wrapper restricted to Italian / English."""
+"""faster-whisper wrapper: Italian / English by default, any Whisper language on request."""
 
 from __future__ import annotations
 
@@ -14,6 +14,37 @@ import numpy as np
 log = logging.getLogger("livetrans.asr")
 
 LANGS = ("it", "en")
+
+# Recognition-language setting: ANY (detect among all of Whisper's languages), IT_EN (each
+# segment either Italian or English, the default), or one fixed language code.
+ANY, IT_EN = "any", "it_en"
+
+
+def all_languages() -> tuple[str, ...]:
+    """Language codes Whisper (multilingual models) can recognise."""
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+    except ImportError:  # private name; fall back to the pair this app is built around
+        return LANGS
+    return tuple(_LANGUAGE_CODES)
+
+
+def normalize_language(value: object) -> str | None:
+    """The setting as used here, or None if it isn't valid. "auto" is the old name of IT_EN."""
+    if value == "auto":
+        return IT_EN
+    if value in (ANY, IT_EN) or (isinstance(value, str) and value in all_languages()):
+        return value
+    return None
+
+
+def detect_among(mode: str) -> tuple[str, ...] | None:
+    """Languages to choose between when detecting (None = all), for a non-fixed mode."""
+    return LANGS if mode == IT_EN else None
+
+
+def is_fixed(mode: str) -> bool:
+    return mode not in (ANY, IT_EN)
 
 # Phrases Whisper tends to hallucinate on noise or silence.
 HALLUCINATIONS = re.compile(
@@ -167,10 +198,15 @@ class Transcriber:
         self.status = "error"
         self.error = "模型加载失败：" + "; ".join(errors)
 
-    def pick_language(self, audio: np.ndarray) -> tuple[str, float]:
+    def pick_language(self, audio: np.ndarray, among: tuple[str, ...] | None = LANGS) -> tuple[str, float]:
+        """Most likely language of the audio, restricted to `among` (None = any), and its
+        probability relative to those candidates."""
         _, _, probs = self.model.detect_language(audio)
-        scores = {lang: p for lang, p in probs if lang in LANGS}
-        lang = max(LANGS, key=lambda k: scores.get(k, 0.0))
+        if among is None:
+            lang, p = max(probs, key=lambda lp: lp[1])
+            return lang, p
+        scores = {lang: p for lang, p in probs if lang in among}
+        lang = max(among, key=lambda k: scores.get(k, 0.0))
         total = sum(scores.values()) or 1.0
         return lang, scores.get(lang, 0.0) / total
 
@@ -190,12 +226,13 @@ class Transcriber:
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
         return re.sub(r"[.…]+$", "", text).strip()
 
-    def transcribe(self, audio: np.ndarray, language: str = "auto", prompt: str = "") -> dict:
+    def transcribe(self, audio: np.ndarray, language: str = IT_EN, prompt: str = "") -> dict:
         t0 = time.time()
-        if language in LANGS:
-            lang, lang_prob = language, 1.0
+        mode = normalize_language(language) or IT_EN
+        if is_fixed(mode):
+            lang, lang_prob = mode, 1.0
         else:
-            lang, lang_prob = self.pick_language(audio)
+            lang, lang_prob = self.pick_language(audio, detect_among(mode))
         segments, _ = self.model.transcribe(
             audio,
             language=lang,
