@@ -235,6 +235,7 @@ function connectWs() {
   ws.onclose = () => {
     state.wsReady = false;
     setPill($('stWs'), '后端：未连接，重连中…', 'err');
+    clearLiveLines();
     setTimeout(connectWs, 2000);
   };
 
@@ -550,6 +551,15 @@ transcriptEl.addEventListener('scroll', () => {
 $('jumpBtn').onclick = () => {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 };
+
+// When the connection drops, the backend loses the segment being spoken (and its queue),
+// and the next connection numbers segments from 1 again: live lines left over from the old
+// connection would never be finalized or removed, so they go now, with their live translation.
+function clearLiveLines() {
+  resetLive();
+  transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
+  $('emptyHint').classList.toggle('hidden', transcriptEl.querySelector('.seg') !== null);
+}
 
 // The live line of the segment being spoken: words pop in as Whisper hears them.
 function partialEl(index) {
