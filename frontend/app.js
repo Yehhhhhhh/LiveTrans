@@ -450,7 +450,8 @@ const newLive = (index) => ({
   sentences: [],
   done: new Map(), // sentence text -> translation
   failed: new Set(), // sentence texts not to retry; the final pass still follows
-  shown: [], // per sentence position: the finished draft on screen  req: null,
+  shown: [], // per sentence position: the finished draft on screen
+  req: null, // the draft translation request in flight
 });
 let live = newLive(-1);
 // Partials drop Whisper's closing period, so it's ignored when matching sentences.
