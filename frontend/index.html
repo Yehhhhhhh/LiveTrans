@@ -20,6 +20,7 @@
         <option value="both">麦克风 + 系统音频</option>
       </select>
       <select id="micSel" title="麦克风设备"></select>
+      <button id="switchShareBtn" class="hidden" title="重新选择要共享的窗口/标签页/屏幕，识别不中断">换窗口</button>
     </div>
 
     <button id="startBtn" class="primary">开始</button>
@@ -53,20 +54,25 @@
   <main id="transcript" class="transcript">
     <div id="emptyHint" class="empty">
       <p>选择音源后点击「开始」。</p>
-      <p class="sub">系统音频：在弹窗里选择「整个屏幕」或对应的标签页，并勾选「共享系统音频 / 共享标签页音频」。</p>
+      <p class="sub">系统音频：在弹窗里选择「整个屏幕」、某个窗口或标签页，并勾选「共享系统音频 / 共享标签页音频」。</p>
     </div>
   </main>
 
   <button id="jumpBtn" class="jump hidden">↓ 回到最新</button>
+
+  <div id="toast" class="toast hidden" role="alert">
+    <span id="stMsg"></span>
+    <button id="toastClose" class="toast-close" title="关闭">×</button>
+  </div>
 
   <footer class="statusbar">
     <span id="stWs" class="pill">后端：未连接</span>
     <span id="stModel" class="pill">模型：-</span>
     <span id="stVad" class="pill">● 静音</span>
     <span class="meter"><span id="meterBar"></span></span>
+    <span id="shareLabel" class="pill share-label hidden"></span>
     <span id="stAsr" class="pill">识别：-</span>
     <span id="stTr" class="pill">翻译：-</span>
-    <span id="stMsg" class="msg"></span>
   </footer>
 
   <!-- 设置面板 -->

@@ -25,6 +25,7 @@ from pydantic import BaseModel  # noqa: E402
 from asr import Transcriber  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
 from vad import Segmenter, SegmenterParams, SileroModel  # noqa: E402
+from winfo import window_info  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -99,6 +100,15 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/api/status")
 async def api_status() -> dict:
     return status_message()
+
+
+@app.get("/api/window")
+async def api_window(hwnd: int) -> dict:
+    """Name of a shared window: Chrome's window-capture track label carries its native handle."""
+    info = window_info(hwnd)
+    if info is None:
+        raise HTTPException(404, "window not found")
+    return info
 
 
 class TranslateRequest(BaseModel):

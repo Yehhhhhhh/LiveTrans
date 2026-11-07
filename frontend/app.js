@@ -65,7 +65,8 @@ const state = {
   ws: null,
   wsReady: false,
   running: false,
-  audio: null, // { ctx, node, streams }
+  audio: null, // { ctx, node, inputs: { sys?, mic? } }
+  switching: false, // a source swap is waiting on a permission prompt
   streamStartWall: 0,
   session: null,
   segments: [], // segments of the current session, in order
@@ -92,9 +93,20 @@ function showVad(msg) {
   el.title = '人声概率高于阈值才会开始识别。老师说话时人声值总低于阈值，就把「语音判定阈值」调低一些。';
 }
 
+// Messages pop up as a toast at the top centre. They fade after a while, except the
+// translation-backend problem (trMsg), which stays until it is fixed or dismissed.
+const TOAST_MS = 8000;
+let toastTimer = 0;
 function showMsg(text) {
   $('stMsg').textContent = text || '';
+  const toast = $('toast');
+  toast.classList.toggle('hidden', !text);
+  // Just below the top bar, which wraps to more rows on narrow windows.
+  if (text) toast.style.top = `${document.querySelector('.topbar').getBoundingClientRect().bottom + 8}px`;
+  clearTimeout(toastTimer);
+  if (text && text !== trMsg) toastTimer = setTimeout(() => showMsg(''), TOAST_MS);
 }
+$('toastClose').onclick = () => showMsg('');
 
 // A translation-backend problem (e.g. Ollama not running) is shown until the
 // backend works again or another backend is chosen; other messages are kept.
@@ -791,6 +803,8 @@ async function getSystemStream() {
     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     systemAudio: 'include',
     selfBrowserSurface: 'exclude',
+    // Chrome then offers "share this tab instead" in its share bar, switching tabs without a prompt.
+    surfaceSwitching: 'include',
   });
   if (stream.getAudioTracks().length === 0) {
     stream.getTracks().forEach((t) => t.stop());
@@ -814,6 +828,163 @@ async function getMicStream() {
   });
 }
 
+const wantedKinds = (src) => (src === 'both' ? ['sys', 'mic'] : [src === 'system' ? 'sys' : 'mic']);
+
+// 'sys' always comes first in wantedKinds, so the sharing prompt opens while the click's user activation is fresh.
+const acquire = (kind) => (kind === 'sys' ? getSystemStream() : getMicStream());
+
+function stopStream(stream) {
+  stream.getTracks().forEach((t) => t.stop());
+}
+
+function acquireError(e) {
+  return e.name === 'NotAllowedError' ? '已取消或未授权音频采集' : e.message;
+}
+
+// Plugs a stream into the running graph as the current input of its kind,
+// connecting the new one before releasing the old, so audio never gaps.
+function attachInput(kind, stream) {
+  const a = state.audio;
+  const source = a.ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+  const gain = a.ctx.createGain();
+  gain.gain.value = kind === 'mic' ? settings.audio.micGain : settings.audio.sysGain;
+  source.connect(gain).connect(a.node);
+  const input = { kind, stream, source, gain };
+  input.onEnded = () => onInputEnded(input);
+  stream.getTracks().forEach((t) => t.addEventListener('ended', input.onEnded));
+  const old = a.inputs[kind];
+  a.inputs[kind] = input;
+  if (old) releaseInput(old);
+  if (kind === 'sys') describeShare(input);
+  updateSourceUi();
+}
+
+function releaseInput(input) {
+  input.stream.getTracks().forEach((t) => t.removeEventListener('ended', input.onEnded));
+  input.gain.disconnect();
+  input.source.disconnect();
+  stopStream(input.stream);
+}
+
+function detachInput(kind) {
+  const a = state.audio;
+  const input = a?.inputs[kind];
+  if (!input) return;
+  delete a.inputs[kind];
+  releaseInput(input);
+  updateSourceUi();
+}
+
+// The user ended a share (Chrome's "Stop sharing") or a mic went away.
+function onInputEnded(input) {
+  const a = state.audio;
+  if (!state.running || a?.inputs[input.kind] !== input) return;
+  const msg = input.kind === 'sys' ? '屏幕/窗口共享已结束' : '麦克风已断开';
+  detachInput(input.kind);
+  if (Object.keys(a.inputs).length === 0) {
+    stop();
+    showMsg(msg);
+  } else {
+    showMsg(input.kind === 'sys' ? `${msg}，麦克风继续识别；点「共享窗口」可重新共享` : `${msg}，系统音频继续识别`);
+  }
+}
+
+// Swaps inputs while running: the backend keeps one continuous stream, so VAD and transcript carry on.
+async function swapInputs(kinds, replace = false) {
+  if (!state.running || state.switching) return false;
+  state.switching = true;
+  const a = state.audio;
+  const fresh = [];
+  try {
+    for (const kind of kinds) {
+      if (replace || !a.inputs[kind]) fresh.push({ kind, stream: await acquire(kind) });
+    }
+  } catch (e) {
+    fresh.forEach((f) => stopStream(f.stream));
+    if (state.running) showMsg(acquireError(e) + '，已保留原音源');
+    return false;
+  } finally {
+    state.switching = false;
+  }
+  if (!state.running || state.audio !== a) {
+    fresh.forEach((f) => stopStream(f.stream)); // stopped while the prompt was open
+    return false;
+  }
+  showMsg('');
+  fresh.forEach((f) => attachInput(f.kind, f.stream));
+  return true;
+}
+
+async function onSourceChange(prev) {
+  updateSourceUi();
+  if (!state.running) return;
+  const kinds = wantedKinds(settings.source);
+  if (!(await swapInputs(kinds))) {
+    // Prompt cancelled: keep capturing what we had, and show that in the selector.
+    if (state.running && !kinds.every((k) => state.audio.inputs[k])) {
+      settings.source = prev;
+      $('sourceSel').value = prev;
+      $('micSel').classList.toggle('hidden', prev === 'system');
+      saveSettings();
+      updateSourceUi();
+    }
+    return;
+  }
+  for (const kind of Object.keys(state.audio.inputs)) {
+    if (!kinds.includes(kind)) detachInput(kind);
+  }
+  if (kinds.includes('mic')) listMics();
+}
+
+function updateSourceUi() {
+  const sys = state.audio?.inputs.sys;
+  const btn = $('switchShareBtn');
+  btn.classList.toggle('hidden', !state.running || settings.source === 'mic');
+  btn.textContent = sys ? '换窗口' : '共享窗口';
+  const label = $('shareLabel');
+  label.classList.toggle('hidden', !sys);
+  if (!sys) {
+    label.textContent = '';
+    label.title = '';
+  }
+}
+
+// Shows what is being shared. The browser only reveals the surface type; for a window,
+// Chrome's track label carries the native window handle, which the backend resolves to a name.
+async function describeShare(input) {
+  const track = input.stream.getVideoTracks()[0];
+  const surface = track?.getSettings().displaySurface;
+  const raw = track?.label || '';
+  console.debug('[LiveTrans] shared surface:', surface, JSON.stringify(raw));
+  const show = (text, title = text) => {
+    if (state.audio?.inputs.sys !== input) return; // replaced meanwhile
+    $('shareLabel').textContent = text;
+    $('shareLabel').title = title;
+  };
+  if (surface === 'monitor' || /^screen:/.test(raw)) {
+    show('🖥 整个屏幕');
+  } else if (surface === 'browser') {
+    show('🌐 浏览器标签页', '浏览器标签页（浏览器不提供标签页标题）');
+  } else if (surface === 'window' || /^window:/.test(raw)) {
+    show('🪟 窗口');
+    const m = /^window:(\d+):/.exec(raw);
+    if (!m) return;
+    try {
+      const r = await fetch(`/api/window?hwnd=${m[1]}`);
+      if (!r.ok) return;
+      const w = await r.json();
+      const app = w.app || '';
+      const title = w.title && w.title !== app ? w.title : '';
+      const text = [app, title].filter(Boolean).join(' · ');
+      if (text) show(`🪟 ${text}`, `窗口：${text}${w.exe ? `（${w.exe}）` : ''}`);
+    } catch {
+      /* keep the generic label */
+    }
+  } else {
+    show('共享中');
+  }
+}
+
 async function start() {
   if (!state.wsReady) {
     showMsg('后端未连接，请先运行 start.bat');
@@ -821,14 +992,12 @@ async function start() {
   }
   showMsg('');
   const src = settings.source;
-  const streams = [];
+  const acquired = [];
   try {
-    // Ask for screen/tab sharing first, while the click's user activation is fresh.
-    if (src === 'system' || src === 'both') streams.push({ kind: 'sys', stream: await getSystemStream() });
-    if (src === 'mic' || src === 'both') streams.push({ kind: 'mic', stream: await getMicStream() });
+    for (const kind of wantedKinds(src)) acquired.push({ kind, stream: await acquire(kind) });
   } catch (e) {
-    streams.forEach((s) => s.stream.getTracks().forEach((t) => t.stop()));
-    showMsg(e.name === 'NotAllowedError' ? '已取消或未授权音频采集' : e.message);
+    acquired.forEach((a) => stopStream(a.stream));
+    showMsg(acquireError(e));
     return;
   }
 
@@ -839,34 +1008,20 @@ async function start() {
   sink.gain.value = 0;
   node.connect(sink).connect(ctx.destination);
 
-  for (const { kind, stream } of streams) {
-    const source = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
-    const gain = ctx.createGain();
-    gain.gain.value = kind === 'mic' ? settings.audio.micGain : settings.audio.sysGain;
-    source.connect(gain).connect(node);
-    stream.getAudioTracks().forEach((t) =>
-      t.addEventListener('ended', () => {
-        if (state.running) {
-          stop();
-          showMsg(kind === 'sys' ? '屏幕/标签页共享已结束' : '麦克风已断开');
-        }
-      }),
-    );
-  }
-
   const meter = $('meterBar');
   node.port.onmessage = (e) => {
     if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(e.data.pcm.buffer);
     meter.style.width = `${Math.min(100, e.data.rms * 400)}%`;
   };
 
-  state.audio = { ctx, node, streams };
+  state.audio = { ctx, node, inputs: {} };
+  state.running = true;
+  acquired.forEach((a) => attachInput(a.kind, a.stream));
   resetLive();
   transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
   wsSend(asrConfig());
   wsSend({ type: 'start' });
   state.streamStartWall = Date.now();
-  state.running = true;
   $('startBtn').textContent = '停止';
   $('startBtn').classList.add('running');
   if (src !== 'system') listMics();
@@ -877,11 +1032,12 @@ function stop() {
   wsSend({ type: 'stop' });
   const a = state.audio;
   if (a) {
-    a.streams.forEach((s) => s.stream.getTracks().forEach((t) => t.stop()));
+    Object.values(a.inputs).forEach(releaseInput);
     a.ctx.close();
   }
   state.audio = null;
   state.running = false;
+  updateSourceUi();
   $('startBtn').textContent = '开始';
   $('startBtn').classList.remove('running');
   $('meterBar').style.width = '0';
@@ -906,15 +1062,20 @@ $('startBtn').onclick = () => (state.running ? stop() : start());
 
 $('sourceSel').value = settings.source;
 $('sourceSel').onchange = () => {
+  const prev = settings.source;
   settings.source = $('sourceSel').value;
   $('micSel').classList.toggle('hidden', settings.source === 'system');
   saveSettings();
+  onSourceChange(prev);
 };
 $('micSel').classList.toggle('hidden', settings.source === 'system');
 $('micSel').onchange = () => {
   settings.micDeviceId = $('micSel').value;
   saveSettings();
+  if (state.audio?.inputs.mic) swapInputs(['mic'], true);
 };
+// Pick another window/tab/screen without stopping recognition.
+$('switchShareBtn').onclick = () => swapInputs(['sys'], true);
 navigator.mediaDevices.addEventListener?.('devicechange', listMics);
 
 // ---------------------------------------------------------------- settings UI

@@ -63,6 +63,7 @@ button.mini { padding: 2px 6px; }
 .group label { color: var(--muted); }
 .group label.toggle { display: flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; white-space: nowrap; }
 #micSel { max-width: 200px; }
+.share-label { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #sessionSel { max-width: 220px; }
 
 .transcript {
@@ -133,7 +134,14 @@ body.hide-orig .seg .orig { display: none; }
 .pill.speaking { color: var(--accent-text); background: var(--ok); border-color: var(--ok); }
 .meter { width: 100px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
 .meter span { display: block; height: 100%; width: 0; background: var(--ok); transition: width .08s linear; }
-.msg { color: var(--danger); margin-left: auto; }
+.toast {
+  position: fixed; top: 56px; left: 50%; transform: translateX(-50%); z-index: 20;
+  display: flex; align-items: center; gap: 10px;
+  max-width: min(640px, calc(100vw - 32px)); padding: 8px 8px 8px 14px;
+  background: var(--panel); color: var(--danger); border: 1px solid var(--danger); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.18);
+}
+.toast-close { border: none; background: transparent; color: var(--muted); padding: 0 6px; font-size: 16px; line-height: 1; }
 
 .drawer {
   position: fixed;
