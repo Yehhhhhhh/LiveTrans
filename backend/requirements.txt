@@ -1,9 +1,12 @@
-faster-whisper>=1.1.1
-fastapi>=0.115
-uvicorn>=0.30
-websockets>=13
-httpx>=0.27
-numpy
+# Version ranges LiveTrans works with. install.bat installs the exact tested versions from
+# requirements.lock (regenerate it with backend/tools/freeze_lock.py after upgrading).
+faster-whisper>=1.1.1,<2
+onnxruntime>=1.17,<2
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+websockets>=13,<18
+httpx>=0.27,<1
+numpy>=1.26,<3
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
-anthropic>=0.70
+anthropic>=0.70,<3
