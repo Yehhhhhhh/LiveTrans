@@ -93,6 +93,22 @@ function showVad(msg) {
   el.title = '人声概率高于阈值才会开始识别。老师说话时人声值总低于阈值，就把「语音判定阈值」调低一些。';
 }
 
+// Time of the last final transcription, plus the backlog once the GPU falls behind the speaker
+// (pending counts the segment being transcribed, so 1 is normal).
+const asrStat = { ms: null, merged: 1, pending: 0 };
+function showAsr() {
+  const el = $('stAsr');
+  let text = asrStat.ms == null ? '识别：-' : `识别：${asrStat.ms} ms`;
+  if (asrStat.merged > 1) text += ` · 合并 ${asrStat.merged} 段追赶`;
+  const behind = asrStat.pending >= 2;
+  if (behind) text += ` · 待识别 ${asrStat.pending} 段`;
+  const warn = behind || asrStat.merged > 1;
+  setPill(el, text, warn ? 'warn' : asrStat.ms == null ? '' : 'ok');
+  el.title = warn
+    ? '识别速度跟不上说话速度，字幕会滞后。积压时自动把排队的几段合并成一次识别来追赶进度（自动语种时合并的几段共用一个语种）。经常出现可在「设置 → 识别」关闭逐词实时显示，或换用更小的模型。'
+    : '';
+}
+
 // Messages pop up as a toast at the top centre. They fade after a while, except the
 // translation-backend problem (trMsg), which stays until it is fixed or dismissed.
 const TOAST_MS = 8000;
@@ -224,6 +240,9 @@ function connectWs() {
   ws.onopen = () => {
     state.wsReady = true;
     setPill($('stWs'), '后端：已连接', 'ok');
+    // A new connection starts with an empty queue (a dropped one's backlog is gone).
+    asrStat.pending = 0;
+    showAsr();
     wsSend(asrConfig());
     if (state.running) {
       // Backend restarted mid-capture: restart its stream clock.
@@ -255,7 +274,10 @@ function connectWs() {
       if (live.index === msg.index) resetLive();
       partialEl(msg.index)?.remove();
     }
-    else if (msg.type === 'error') showMsg(msg.message);
+    else if (msg.type === 'backlog') {
+      asrStat.pending = msg.pending;
+      showAsr();
+    } else if (msg.type === 'error') showMsg(msg.message);
   };
 }
 
@@ -298,7 +320,9 @@ async function onSegment(msg) {
     offset += s.length;
     return seg;
   });
-  setPill($('stAsr'), `识别：${msg.asr_ms} ms`, 'ok');
+  asrStat.ms = msg.asr_ms;
+  asrStat.merged = msg.merged || 1;
+  showAsr();
   if (settings.tr.enabled) takeLive(segs, msg.index);
   if (segs.some((s) => s.trStatus === 'done')) {
     setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
