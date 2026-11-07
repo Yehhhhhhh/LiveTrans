@@ -232,6 +232,58 @@ function wsSend(obj) {
 
 const sendConfig = debounce(() => wsSend(asrConfig()), 300);
 
+// Resuming after a dropped connection (backend restarted, network blip). Audio sent to the
+// backend is kept until the backend reports it "committed": every segment in it answered, or
+// silence. Audio captured while the connection is down is kept as well. On reconnect the stream
+// resumes at the committed position and the kept audio is sent again, so what was said around
+// the drop is still transcribed, with its own timestamps. At most RESEND_MAX_S is kept.
+// Positions count samples (16 kHz) since 开始.
+const RESEND_MAX_S = 120;
+const resend = { chunks: [], pos: 0, committed: 0 };
+
+function resetResend() {
+  resend.chunks = [];
+  resend.pos = 0;
+  resend.committed = 0;
+}
+
+function trimResend() {
+  const c = resend.chunks;
+  while (c.length && c[0].pos + c[0].pcm.length <= resend.committed) c.shift();
+  while (c.length && resend.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
+}
+
+function sendAudio(pcm) {
+  resend.chunks.push({ pos: resend.pos, pcm });
+  resend.pos += pcm.length;
+  trimResend();
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(pcm);
+}
+
+function onCommitted(pos) {
+  if (pos <= resend.committed) return;
+  resend.committed = pos;
+  trimResend();
+}
+
+// Called on reconnect while capturing: continue the stream where the backend can pick it up.
+function resumeStream() {
+  const first = resend.chunks[0];
+  const from = Math.max(resend.committed, first ? first.pos : resend.pos);
+  const lost = (from - resend.committed) / 16000;
+  wsSend({ type: 'resume', offset: from });
+  resend.committed = from;
+  let sent = 0;
+  for (const ch of resend.chunks) {
+    if (ch.pos + ch.pcm.length <= from) continue;
+    const part = ch.pos >= from ? ch.pcm : ch.pcm.subarray(from - ch.pos);
+    state.ws.send(part);
+    sent += part.length;
+  }
+  if (lost >= 1) showMsg(`断线超过 ${RESEND_MAX_S / 60} 分钟，约 ${Math.round(lost)} 秒语音未能补回`);
+  else if (sent >= 16000) showMsg(`已重新连接，补发断线前后约 ${Math.round(sent / 16000)} 秒语音`);
+}
+
 function connectWs() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
@@ -245,9 +297,8 @@ function connectWs() {
     showAsr();
     wsSend(asrConfig());
     if (state.running) {
-      // Backend restarted mid-capture: restart its stream clock.
-      wsSend({ type: 'start' });
-      state.streamStartWall = Date.now();
+      // Reconnected mid-capture: resend what the backend hasn't answered yet.
+      resumeStream();
     }
   };
 
@@ -264,6 +315,7 @@ function connectWs() {
     } catch {
       return;
     }
+    if (typeof msg.committed === 'number') onCommitted(msg.committed);
     if (msg.type === 'status') onStatus(msg);
     else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);
@@ -1044,7 +1096,7 @@ async function start() {
 
   const meter = $('meterBar');
   node.port.onmessage = (e) => {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(e.data.pcm.buffer);
+    sendAudio(e.data.pcm);
     meter.style.width = `${Math.min(100, e.data.rms * 400)}%`;
   };
 
@@ -1054,6 +1106,7 @@ async function start() {
   resetLive();
   transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
   wsSend(asrConfig());
+  resetResend();
   wsSend({ type: 'start' });
   state.streamStartWall = Date.now();
   $('startBtn').textContent = '停止';
