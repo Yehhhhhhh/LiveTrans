@@ -956,10 +956,18 @@ async function describeShare(input) {
   const surface = track?.getSettings().displaySurface;
   const raw = track?.label || '';
   console.debug('[LiveTrans] shared surface:', surface, JSON.stringify(raw));
-  const show = (text, title = text) => {
+  const show = (text, title = text, icon = '') => {
     if (state.audio?.inputs.sys !== input) return; // replaced meanwhile
-    $('shareLabel').textContent = text;
-    $('shareLabel').title = title;
+    const label = $('shareLabel');
+    label.textContent = text;
+    label.title = title;
+    if (icon) {
+      const img = document.createElement('img');
+      img.className = 'share-icon';
+      img.alt = '';
+      img.src = icon;
+      label.prepend(img);
+    }
   };
   if (surface === 'monitor' || /^screen:/.test(raw)) {
     show('🖥 整个屏幕');
@@ -976,7 +984,9 @@ async function describeShare(input) {
       const app = w.app || '';
       const title = w.title && w.title !== app ? w.title : '';
       const text = [app, title].filter(Boolean).join(' · ');
-      if (text) show(`🪟 ${text}`, `窗口：${text}${w.exe ? `（${w.exe}）` : ''}`);
+      // The app's own icon replaces the generic window emoji when the backend could read it.
+      const icon = /^data:image\/png;base64,/.test(w.icon || '') ? w.icon : '';
+      if (text) show(icon ? text : `🪟 ${text}`, `窗口：${text}${w.exe ? `（${w.exe}）` : ''}`, icon);
     } catch {
       /* keep the generic label */
     }
