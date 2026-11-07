@@ -226,13 +226,13 @@ function connectWs() {
   ws.onopen = () => {
     state.wsReady = true;
     setPill($('stWs'), '后端：已连接', 'ok');
-    loadOtherLangs();
     wsSend(asrConfig());
     if (state.running) {
       // Backend restarted mid-capture: restart its stream clock.
       wsSend({ type: 'start' });
       state.streamStartWall = Date.now();
     }
+    loadOtherLangs(); // in case the backend wasn't up when the page loaded
   };
 
   ws.onclose = () => {
