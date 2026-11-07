@@ -38,6 +38,9 @@ class FakeSegmenter:
     def current_audio(self):
         return None
 
+    def committed_frames(self):
+        return 0
+
 
 class FakeTranscriber:
     def __init__(self, status):

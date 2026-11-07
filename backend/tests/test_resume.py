@@ -1,0 +1,177 @@
+"""Resuming a stream after a dropped connection: committed positions and the "resume" message."""
+
+from contextlib import contextmanager
+
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+import server
+from vad import FRAME, Segment, Segmenter, SegmenterParams
+
+CHUNK = FRAME * 32  # 16384 samples, ~1 s
+
+
+# ------------------------------------------------------------------ Segmenter.committed_frames
+
+
+class ScriptedVad:
+    """Speech probability per frame from a list; silence after it runs out."""
+
+    def __init__(self, probs):
+        self.probs = list(probs)
+
+    def new_state(self):
+        return self
+
+    def reset(self):
+        pass
+
+    def prob(self, frame):
+        return self.probs.pop(0) if self.probs else 0.0
+
+
+def frames(n):
+    return np.zeros(n * FRAME, dtype=np.int16).tobytes()
+
+
+def test_committed_frames_idle_keeps_the_preroll():
+    seg = Segmenter(ScriptedVad([]), SegmenterParams())
+    seg.feed(frames(50))
+    preroll = len(seg.preroll)
+    assert preroll > 0
+    assert seg.committed_frames() == 50 - preroll
+
+
+def test_committed_frames_stops_at_the_segment_in_progress():
+    seg = Segmenter(ScriptedVad([0.0] * 20 + [0.9] * 30), SegmenterParams())
+    seg.feed(frames(50))
+    assert seg.speaking
+    assert seg.committed_frames() == seg.seg_start_frame
+    assert seg.committed_frames() < 20  # the segment includes its pre-roll
+
+
+# ------------------------------------------------------------------ /ws committed and resume
+
+
+class FakeSegmenter:
+    """Every audio message becomes one finished segment covering exactly that audio."""
+
+    def __init__(self, model, params=None):
+        self.params = params
+        self.reset()
+
+    def reset(self):
+        self.index = 0
+        self.pos = 0
+        self.speaking = False
+        self.frames_seen = 0
+
+    def feed(self, pcm):
+        n = len(pcm) // 2
+        self.index += 1
+        s = Segment(start=self.pos / 16000, audio=np.zeros(n, np.float32), index=self.index)
+        self.pos += n
+        return [s]
+
+    def committed_frames(self):
+        return self.pos // FRAME
+
+    def flush(self):
+        return []
+
+    def take_dropped(self):
+        return []
+
+    def take_peak_prob(self):
+        return 0.0
+
+    def current_audio(self):
+        return None
+
+
+class FakeTranscriber:
+    def __init__(self, status):
+        self.status = status
+        self.error = ""
+        self.model_name = "fake"
+        self.device = "cpu"
+        self.compute_type = "int8"
+
+    def transcribe(self, audio, language="auto", prompt=""):
+        return {"lang": "it", "lang_prob": 1.0, "text": "testo", "asr_ms": 1}
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    t = FakeTranscriber("ready")
+    monkeypatch.setattr(server, "transcriber", t)
+    monkeypatch.setattr(server, "Segmenter", FakeSegmenter)
+    monkeypatch.setattr(server, "SileroModel", lambda: None)
+    monkeypatch.setattr(server, "load_model_in_background", lambda: None)
+    monkeypatch.setattr(server, "MODEL_WAIT_POLL_S", 0.01)
+    return t
+
+
+@contextmanager
+def session(first="start", **extra):
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as client, client.websocket_connect(
+        "ws://127.0.0.1:8765/ws"
+    ) as sock:
+        assert sock.receive_json()["type"] == "status"
+        sock.send_json({"type": "config", "asr": {"partial": False}})
+        sock.send_json({"type": first, **extra})
+        yield sock
+
+
+def read_until(sock, pred, limit=200):
+    seen = []
+    for _ in range(limit):
+        m = sock.receive_json()
+        seen.append(m)
+        if pred(m):
+            return seen
+    raise AssertionError(f"no matching message in {seen}")
+
+
+def test_result_carries_the_committed_position(fake):
+    with session() as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert seg["committed"] == CHUNK
+        assert seg["start"] == 0.0
+
+
+def test_committed_never_passes_an_unanswered_segment(fake):
+    fake.status = "loading"  # segments wait, unanswered
+    with session() as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seen = read_until(sock, lambda m: m["type"] == "backlog" and m["pending"] == 2)
+        assert all(m["committed"] == 0 for m in seen if "committed" in m)
+        fake.status = "ready"
+        first = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert first["index"] == 1
+        # The second segment (starting at CHUNK) is still unanswered: committed stops there.
+        assert first["committed"] == CHUNK
+        second = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert second["index"] == 2
+        assert second["committed"] == 2 * CHUNK
+
+
+def test_resume_continues_positions_and_timestamps(fake):
+    offset = 10 * 16000
+    with session("resume", offset=offset) as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert seg["start"] == 10.0
+        assert seg["committed"] == offset + CHUNK
+
+
+def test_start_resets_the_offset(fake):
+    with session("resume", offset=160000) as sock:
+        sock.send_json({"type": "start"})
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert seg["start"] == 0.0
+        assert seg["committed"] == CHUNK

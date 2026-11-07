@@ -28,7 +28,7 @@ from starlette.websockets import WebSocketState  # noqa: E402
 from asr import Transcriber  # noqa: E402
 from guard import LocalOnlyMiddleware  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
-from vad import Segment, Segmenter, SegmenterParams, SileroModel  # noqa: E402
+from vad import FRAME, Segment, Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -257,12 +257,27 @@ async def ws_audio(ws: WebSocket) -> None:
 
     in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
 
+    # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
+    # resends it from the last "committed" position, i.e. the point before which every segment
+    # has been answered (or was silence). Positions are samples since the page pressed 开始.
+    stream = {"base": 0}  # position of this connection's first sample (set by "resume")
+    unsent: dict[int, int] = {}  # segment index -> start position, queued but not answered yet
+
+    def committed() -> int:
+        pos = seg.committed_frames() * FRAME
+        if unsent:
+            pos = min(pos, min(unsent.values()))
+        return stream["base"] + pos
+
     async def send_backlog() -> None:
         # Segments waiting for (or in) their final transcription; the UI warns when it grows.
-        await ws.send_json({"type": "backlog", "pending": queue.qsize() + in_hand[0]})
+        await ws.send_json(
+            {"type": "backlog", "pending": queue.qsize() + in_hand[0], "committed": committed()}
+        )
 
     async def transcribe_batch(items: list[Segment]) -> None:
         if transcriber.status != "ready":
+            answered(items)
             await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
             return
         item = merge_segments(items)
@@ -273,12 +288,17 @@ async def ws_audio(ws: WebSocket) -> None:
                 )
         except Exception as e:  # noqa: BLE001
             log.exception("Transcription failed")
+            answered(items)
             await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
             return
+        answered(items)
         res.update(
             type="segment",
             index=item.index,
-            start=round(item.start, 3),
+            start=round(item.start + stream["base"] / 16000, 3),
+            # Sent with the result itself: if the connection drops right after, the page won't
+            # resend (and show twice) the audio of a sentence it already has.
+            committed=committed(),
             duration=round(len(item.audio) / 16000, 2),
             merged=len(items),
         )
@@ -289,6 +309,10 @@ async def ws_audio(ws: WebSocket) -> None:
             f" merged {len(items)}" if len(items) > 1 else "", res["text"],
         )
         await ws.send_json(res)
+
+    def answered(items: list[Segment]) -> None:
+        for it in items:
+            unsent.pop(it.index, None)
 
     async def wait_for_model() -> None:
         # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
@@ -384,6 +408,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     rec[0].writeframes(msg["bytes"])
                 new = seg.feed(msg["bytes"])
                 for s in new:
+                    unsent[s.index] = round(s.start * 16000)
                     queue.put_nowait(s)
                 if new:
                     await send_backlog()
@@ -393,9 +418,12 @@ async def ws_audio(ws: WebSocket) -> None:
                 if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
                     speaking = seg.speaking
                     last_level = now
-                    await ws.send_json(
-                        {"type": "vad", "speaking": speaking, "prob": round(seg.take_peak_prob(), 2)}
-                    )
+                    await ws.send_json({
+                        "type": "vad",
+                        "speaking": speaking,
+                        "prob": round(seg.take_peak_prob(), 2),
+                        "committed": committed(),
+                    })
                 maybe_partial()
             elif msg.get("text"):
                 data = json.loads(msg["text"])
@@ -408,13 +436,18 @@ async def ws_audio(ws: WebSocket) -> None:
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
-                elif kind == "start":
+                elif kind in ("start", "resume"):
+                    # "resume": a reconnecting page continues its stream at `offset` and resends
+                    # the audio from there; segment start times continue from that position.
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
+                    unsent.clear()
+                    stream["base"] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
                 elif kind == "stop":
                     close_recording()
                     new = seg.flush()
                     for s in new:
+                        unsent[s.index] = round(s.start * 16000)
                         queue.put_nowait(s)
                     if new:
                         await send_backlog()
