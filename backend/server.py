@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # no
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
+from starlette.websockets import WebSocketState  # noqa: E402
 
 from asr import Transcriber  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
@@ -191,6 +192,8 @@ VAD_LEVEL_INTERVAL_S = 0.25
 MERGE_BACKLOG = 2
 MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
 MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
+# While the Whisper model is still loading, queued speech waits; status is checked this often.
+MODEL_WAIT_POLL_S = 0.2
 
 
 def merge_segments(items: list[Segment]) -> Segment:
@@ -254,7 +257,7 @@ async def ws_audio(ws: WebSocket) -> None:
 
     async def transcribe_batch(items: list[Segment]) -> None:
         if transcriber.status != "ready":
-            await ws.send_json({"type": "error", "message": "模型尚未就绪，这段语音被跳过"})
+            await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
             return
         item = merge_segments(items)
         try:
@@ -281,17 +284,35 @@ async def ws_audio(ws: WebSocket) -> None:
         )
         await ws.send_json(res)
 
+    async def wait_for_model() -> None:
+        # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
+        # keep that speech queued and transcribe it (merged, see take_batch) once the model is
+        # ready, instead of dropping it. The page shows the backlog meanwhile.
+        if transcriber.status in ("idle", "loading"):
+            await send_backlog()
+            while transcriber.status in ("idle", "loading"):
+                await asyncio.sleep(MODEL_WAIT_POLL_S)
+
     async def worker() -> None:
         carry: Segment | None = None
         while True:
-            first = carry or await queue.get()
-            items, carry = take_batch(first, queue)
-            in_hand[0] = len(items) + (carry is not None)
             try:
-                await transcribe_batch(items)
-            finally:
-                in_hand[0] = carry is not None
-            await send_backlog()
+                first = carry or await queue.get()
+                carry = None
+                in_hand[0] = 1
+                await wait_for_model()
+                items, carry = take_batch(first, queue)
+                in_hand[0] = len(items) + (carry is not None)
+                try:
+                    await transcribe_batch(items)
+                finally:
+                    in_hand[0] = carry is not None
+                await send_backlog()
+            except Exception:  # noqa: BLE001 - one bad batch must not stop transcription for good
+                if ws.client_state != WebSocketState.CONNECTED:
+                    return  # the page went away; ws_audio cancels this task anyway
+                log.exception("ASR worker failed on a batch; continuing")
+                carry, in_hand[0] = None, 0
 
     def partial_job(audio, index: int) -> str:
         lang = opts["language"]
@@ -330,8 +351,12 @@ async def ws_audio(ws: WebSocket) -> None:
             return
         live["busy"] = True
         live["last_frame"] = seg.frames_seen
-        asyncio.create_task(run_partial(audio, seg.index))
+        # The event loop only keeps weak references to tasks: hold one until it is done.
+        t = asyncio.create_task(run_partial(audio, seg.index))
+        partial_tasks.add(t)
+        t.add_done_callback(partial_tasks.discard)
 
+    partial_tasks: set[asyncio.Task] = set()
     task = asyncio.create_task(worker())
     speaking = False
     last_level = 0.0
@@ -397,6 +422,8 @@ async def ws_audio(ws: WebSocket) -> None:
         close_recording()
         clients.discard(ws)
         task.cancel()
+        for t in partial_tasks:
+            t.cancel()
 
 
 class NoCacheStaticFiles(StaticFiles):
