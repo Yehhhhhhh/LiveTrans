@@ -27,6 +27,7 @@ from translate import TranslateError, Translator, clean_output, clean_partial  #
 from vad import Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
 from asr import IT_EN, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
+from translate import DEFAULT_DOMAIN  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -124,12 +125,15 @@ class TranslateRequest(BaseModel):
     text: str
     context: list[dict] = []
     glossary: list[dict] = []
+    domain: str = DEFAULT_DOMAIN  # course domain for the system prompt; "" = unspecified
 
 
 @app.post("/api/translate")
 async def api_translate(req: TranslateRequest) -> dict:
     try:
-        out = await translator.translate(req.provider, req.config, req.text, req.context, req.glossary)
+        out = await translator.translate(
+            req.provider, req.config, req.text, req.context, req.glossary, req.domain
+        )
     except TranslateError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"translation": out}
@@ -156,7 +160,7 @@ async def api_translate_stream(req: TranslateRequest) -> StreamingResponse:
         raw, shown = "", ""
         try:
             async for delta in translator.translate_stream(
-                req.provider, req.config, req.text, req.context, req.glossary
+                req.provider, req.config, req.text, req.context, req.glossary, req.domain
             ):
                 raw += delta
                 text = clean_partial(raw)

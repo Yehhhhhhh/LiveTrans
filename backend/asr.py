@@ -61,8 +61,6 @@ STOCK_PHRASES = re.compile(
     re.I,
 )
 
-# The fixed header app.js puts before the glossary terms.
-PROMPT_HEADER_WORDS = {"lezione", "di", "telecomunicazioni", "telecommunications", "lecture"}
 # Ignored when deciding whether an output only echoes the prompt.
 FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
 _CLAUSE = re.compile(r"[.,;:!?…]+")
@@ -112,8 +110,20 @@ def collapse_repeats(text: str) -> str:
     return " ".join(out)
 
 
-def prompt_words(prompt: str) -> set[str]:
-    return set(_WORD.findall(prompt.lower())) - PROMPT_HEADER_WORDS if prompt else set()
+def split_prompt(prompt: str) -> tuple[set[str], set[str]]:
+    """Words of the course hint and of the glossary terms in a Whisper prompt.
+
+    app.js builds the prompt as "<course hint>. <term>, <term>, ..." (the hint is set in
+    设置 → 识别, default "Lezione di telecomunicazioni / Telecommunications lecture"), or just
+    "<term>, <term>, ..." when the hint is empty: the hint is everything before the first ". ".
+    """
+    if not prompt:
+        return set(), set()
+    hint, sep, terms = prompt.partition(". ")
+    if not sep:
+        hint, terms = "", prompt
+    hint_words = set(_WORD.findall(hint.lower()))
+    return hint_words, set(_WORD.findall(terms.lower())) - hint_words
 
 
 def clean_text(text: str, prompt: str = "") -> str:
@@ -130,13 +140,13 @@ def clean_text(text: str, prompt: str = "") -> str:
     clauses = [" ".join(_WORD.findall(c)) for c in _CLAUSE.split(text.lower())]
     if all(STOCK_PHRASES.match(c) for c in clauses if c):
         return ""
-    # Echo of the glossary prompt: content words that all come from the prompt (or its header)
-    # are Whisper reciting its prompt, not the lecturer speaking.
+    # Echo of the glossary prompt: content words that all come from the prompt (or its course
+    # hint) are Whisper reciting its prompt, not the lecturer speaking.
     content = [w for w in words if w not in FUNCTION_WORDS]
-    vocab = prompt_words(prompt)
-    if prompt and content and all(w in PROMPT_HEADER_WORDS for w in content):
+    hint, vocab = split_prompt(prompt)
+    if hint and content and all(w in hint for w in content):
         return ""
-    if vocab and len(content) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in content):
+    if vocab and len(content) >= 3 and all(w in vocab or w in hint for w in content):
         return ""
     return text
 
