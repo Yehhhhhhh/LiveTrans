@@ -15,7 +15,13 @@ if not exist .venv\Scripts\python.exe (
 
 echo [LiveTrans] Installing dependencies (incl. CUDA/cuDNN runtime, about 1.5GB) ...
 .venv\Scripts\python -m pip install --upgrade pip
-.venv\Scripts\python -m pip install -r backend\requirements.txt
+rem requirements.lock pins the exact versions LiveTrans is tested with. If it can't be
+rem installed (e.g. a different Python version), fall back to the version ranges.
+.venv\Scripts\python -m pip install -r backend\requirements.lock
+if errorlevel 1 (
+    echo [LiveTrans] Pinned versions failed to install, trying requirements.txt instead ...
+    .venv\Scripts\python -m pip install -r backend\requirements.txt
+)
 if errorlevel 1 (
     echo [LiveTrans] Dependency installation failed.
     pause
