@@ -9,11 +9,22 @@ const DEFAULTS = {
   micDeviceId: '',
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
-  asr: { language: 'it_en', lastOther: 'fr', vadThreshold: 0.5, minSilenceMs: 600, maxSegmentS: 8, glossaryPrompt: true, partial: true },
+  asr: {
+    language: 'it_en',
+    lastOther: 'fr',
+    vadThreshold: 0.5,
+    minSilenceMs: 600,
+    maxSegmentS: 8,
+    glossaryPrompt: true,
+    // Course name in the lecture's language, put before the glossary terms in the Whisper prompt.
+    hint: 'Lezione di telecomunicazioni / Telecommunications lecture',
+    partial: true,
+  },
   tr: {
     enabled: true,
     live: true,
     useLocal: false, // overrides provider with the local Ollama model
+    domain: '通信工程', // course domain named in the translation prompt; '' = unspecified
     local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
     provider: 'openai',
     contextSize: 3,
@@ -174,7 +185,11 @@ function buildAsrPrompt() {
       len += k.length + 2;
     }
   }
-  return terms.length ? `Lezione di telecomunicazioni / Telecommunications lecture. ${terms.join(', ')}.` : '';
+  if (!terms.length) return '';
+  // Format "<hint>. <term>, <term>.": the backend reads the hint as the text before the first ". "
+  // (asr.split_prompt) to spot Whisper reciting it.
+  const hint = (settings.asr.hint || '').trim().replace(/[\s.]+$/, '');
+  return `${hint ? `${hint}. ` : ''}${terms.join(', ')}.`;
 }
 
 function escapeRe(s) {
@@ -358,6 +373,7 @@ function translationRequest(text, context) {
     text,
     context,
     glossary: relevantGlossary([text, ...context.map((c) => c.src)]),
+    domain: (settings.tr.domain || '').trim(),
   };
 }
 
@@ -1146,6 +1162,7 @@ bind('clKey', 'tr.claude.apiKey');
 bind('clModel', 'tr.claude.model');
 bind('clEffort', 'tr.claude.effort');
 bind('trContext', 'tr.contextSize');
+bind('trDomain', 'tr.domain');
 bind('locBase', 'tr.local.baseUrl');
 bind('locModel', 'tr.local.model');
 updateProviderFields();
@@ -1259,6 +1276,7 @@ bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);
 bind('asrGlossary', 'asr.glossaryPrompt', sendConfig);
+bind('asrHint', 'asr.hint', sendConfig);
 bind('asrPartial', 'asr.partial', sendConfig);
 
 const showGain = () => {

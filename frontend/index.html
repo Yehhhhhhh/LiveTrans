@@ -92,6 +92,8 @@
     <section class="pane" data-pane="tr">
       <label class="row"><input type="checkbox" id="trEnabled"> 启用翻译</label>
       <label class="row"><input type="checkbox" id="trLive"> 说话时提前翻译（需开启“逐词实时显示”；译文更早出现，但 API 调用次数会增加数倍）</label>
+      <label class="field">课程领域 <input id="trDomain" type="text" maxlength="100" placeholder="例如 通信工程、机器学习、经济学"></label>
+      <p class="hint">告诉翻译模型这是什么课，帮助它理解专业内容；留空则不指定。</p>
       <label class="field">服务商
         <select id="trProvider">
           <option value="openai">OpenAI 兼容接口</option>
@@ -151,6 +153,8 @@
       <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
       <label class="field">单段最长 (秒) <input id="vadMax" type="number" step="1" min="3" max="20"></label>
       <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
+      <label class="field">识别提示语 <input id="asrHint" type="text" maxlength="150" placeholder="例如 Lezione di economia / Economics lecture"></label>
+      <p class="hint">用讲课的语言写一句课程名称，和术语表一起提示 Whisper，提高专业词识别率；可留空。</p>
       <label class="row"><input type="checkbox" id="asrPartial"> 说话时逐词实时显示（句子结束后替换为精确结果）</label>
       <p class="hint">句末静音越短，出字越快但句子越碎；超过单段最长会在短停顿处或强制切分。</p>
     </section>
