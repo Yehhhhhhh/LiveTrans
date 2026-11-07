@@ -22,10 +22,11 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from asr import IT_EN, Transcriber, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
+from asr import Transcriber  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
 from vad import Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
+from asr import IT_EN, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
