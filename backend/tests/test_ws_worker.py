@@ -67,7 +67,8 @@ def fake(monkeypatch):
 @contextmanager
 def session():
     """A started /ws session; always closed, so a failing assertion can't hang TestClient."""
-    with TestClient(server.app) as client, client.websocket_connect("/ws") as sock:
+    # Host as the browser sends it (TestClient's default "testserver" is refused by guard.py).
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as client, client.websocket_connect("ws://127.0.0.1:8765/ws") as sock:
         assert sock.receive_json()["type"] == "status"
         sock.send_json({"type": "config", "asr": {"partial": False}})
         sock.send_json({"type": "start"})

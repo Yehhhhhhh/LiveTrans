@@ -26,6 +26,7 @@ from pydantic import BaseModel  # noqa: E402
 from starlette.websockets import WebSocketState  # noqa: E402
 
 from asr import Transcriber  # noqa: E402
+from guard import LocalOnlyMiddleware  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
 from vad import Segment, Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
@@ -40,6 +41,9 @@ DEVICE = os.environ.get("LIVETRANS_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
 # Set LIVETRANS_RECORD=1 to save each capture's raw 16 kHz audio to recordings/ (for tuning).
 RECORD = os.environ.get("LIVETRANS_RECORD", "") == "1"
+# Host names (besides localhost and IP addresses) the page may be opened under, comma-separated,
+# e.g. this PC's network name when LIVETRANS_HOST=0.0.0.0. See guard.py.
+ALLOWED_HOSTS = frozenset(os.environ.get("LIVETRANS_ALLOWED_HOSTS", "").split(","))
 RECORDINGS = ROOT / "recordings"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -98,6 +102,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# Other websites open in the browser must not reach /ws or the API (see guard.py).
+app.add_middleware(LocalOnlyMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 @app.get("/api/status")
