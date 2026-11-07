@@ -134,6 +134,11 @@
 | `LIVETRANS_COMPUTE_TYPE` | `auto` | Whisper 计算精度，如 `float16` / `int8_float16` / `int8` |
 | `LIVETRANS_HOST` | `127.0.0.1` | 监听地址 |
 | `LIVETRANS_PORT` | `8765` | 端口 |
+| `LIVETRANS_ALLOWED_HOSTS` | - | 除 `localhost` 和 IP 地址外，还允许用哪些主机名打开页面，逗号分隔（例如 `LIVETRANS_HOST=0.0.0.0` 时本机的网络名） |
+
+后端只接受来自自己页面的请求：浏览器里打开的其他网站不能连接 `/ws` 或调用 API（会被拒绝并在日志中记录），命令行工具、脚本不受影响。用 IP 地址或 `localhost` 打开页面都可以；用其他主机名打开时，需要把它加到 `LIVETRANS_ALLOWED_HOSTS`。
+
+注意：设置 `LIVETRANS_HOST=0.0.0.0` 让局域网访问时，同一网络中的任何人都可以使用这个后端，包括用它转发翻译请求，请只在可信网络中这样做。
 | `LIVETRANS_RECORD` | - | 设为 `1` 时把每次采集的原始 16kHz 音频保存到 `recordings/`，用于调参 |
 | `HF_ENDPOINT` | - | HuggingFace 镜像 |
 
