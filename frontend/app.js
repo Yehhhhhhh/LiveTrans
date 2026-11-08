@@ -240,8 +240,10 @@ function connectWs() {
   ws.onopen = () => {
     state.wsReady = true;
     setPill($('stWs'), '后端：已连接', 'ok');
-    // A new connection starts with an empty queue (a dropped one's backlog is gone).
+    // A new connection starts with an empty queue (a dropped one's backlog is gone),
+    // so neither the backlog nor the last merge note applies any more.
     asrStat.pending = 0;
+    asrStat.merged = 1;
     showAsr();
     wsSend(asrConfig());
     if (state.running) {
