@@ -145,7 +145,12 @@ def clean_text(text: str, prompt: str = "") -> str:
     # hint) are Whisper reciting its prompt, not the lecturer speaking.
     content = [w for w in words if w not in FUNCTION_WORDS]
     hint, vocab = split_prompt(prompt)
-    if hint and content and all(w in hint for w in content):
+    # Only a real echo of the hint: at least two of its content words (a hint with a single content
+    # word can't be told apart). A lecturer saying just "Economics." under the hint
+    # "Economics lecture" is speech, not an echo.
+    hint_content = hint - FUNCTION_WORDS
+    echo_min = min(2, len(hint_content))
+    if hint and content and all(w in hint for w in content) and len(set(content)) >= echo_min:
         return ""
     if vocab and len(content) >= 3 and all(w in vocab or w in hint for w in content):
         return ""

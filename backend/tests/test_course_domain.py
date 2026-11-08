@@ -68,3 +68,17 @@ def test_hint_alone_without_glossary_terms():
     assert terms == set()
     assert clean_text("Economics lecture.", prompt) == ""
     assert clean_text("Oggi parliamo di inflazione.", prompt) == "Oggi parliamo di inflazione."
+
+
+def test_a_single_hint_word_is_speech_not_an_echo():
+    prompt = "Lezione di economia / Economics lecture. inflazione, PIL."
+    assert clean_text("Economics.", prompt) == "Economics."
+    assert clean_text("Lezione.", prompt) == "Lezione."
+    # two or more words of the hint are still an echo
+    assert clean_text("Economics lecture.", prompt) == ""
+    assert clean_text("Lezione di economia.", prompt) == ""
+
+
+def test_hint_with_one_content_word_still_filters_its_echo():
+    prompt = "Economia. inflazione, PIL."
+    assert clean_text("Economia.", prompt) == ""
