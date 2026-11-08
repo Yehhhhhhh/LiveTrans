@@ -36,11 +36,15 @@ def top_level(path: Path) -> list[Requirement]:
 def closure(roots: list[Requirement]) -> dict[str, metadata.Distribution]:
     """Installed distributions reachable from roots, following requirements whose markers apply."""
     found: dict[str, metadata.Distribution] = {}
+    # (package, extra) pairs already expanded, "" being the package itself. Each is expanded
+    # once, so cycles terminate, including ones through extras (a[x] -> b[y] -> a[x]).
+    seen: set[tuple[str, str]] = set()
     todo = [(r, frozenset()) for r in roots]
     while todo:
-        req, extras = todo.pop()
+        req, parent_extras = todo.pop()
+        # req comes from a package requested with parent_extras; its marker may name one of them.
         env_ok = req.marker is None or any(
-            req.marker.evaluate({"extra": e}) for e in (extras or {""})
+            req.marker.evaluate({"extra": e}) for e in (parent_extras or {""})
         )
         if not env_ok:
             continue
@@ -51,12 +55,13 @@ def closure(roots: list[Requirement]) -> dict[str, metadata.Distribution]:
             sys.exit(f"{req.name} is required but not installed; run pip install -r requirements.txt first")
         if not req.specifier.contains(dist.version, prereleases=True):
             sys.exit(f"installed {req.name} {dist.version} does not satisfy {req}")
-        new_extras = frozenset(req.extras)
-        if name in found and not new_extras:
-            continue
         found[name] = dist
+        new = {e for e in {"", *req.extras} if (name, e) not in seen}
+        if not new:
+            continue
+        seen.update((name, e) for e in new)
         for sub in dist.requires or []:
-            todo.append((Requirement(sub), new_extras))
+            todo.append((Requirement(sub), frozenset(new)))
     return found
 
 
