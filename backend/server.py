@@ -315,8 +315,11 @@ async def ws_audio(ws: WebSocket) -> None:
                     asr = data.get("asr") or {}
                     apply_config(seg, asr)
                     mode = normalize_language(asr.get("language"))
-                    if mode:
+                    if mode and mode != opts["language"]:
                         opts["language"] = mode
+                        # The language detected for the segment in progress was chosen under the
+                        # old mode: detect again for its next partials.
+                        live.update(lang_index=0, lang="")
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
