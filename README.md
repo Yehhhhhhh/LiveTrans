@@ -164,3 +164,21 @@ frontend/vendor/katex/ KaTeX 公式渲染（离线）
 install.bat            创建 .venv 并安装依赖
 start.bat              启动后端，就绪后打开页面
 ```
+
+## 持续集成（GitHub Actions）
+
+每个 Pull Request 创建或更新时自动运行两个工作流：
+
+- **CI**（`.github/workflows/ci.yml`）
+  - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、`.bat` 必须是纯 ASCII + CRLF。
+  - Build & Test（Windows、Python 3.12）：按 install.bat 的方式安装依赖，检查 `import server`，有 `backend/tests` 时运行 pytest。
+  - 项目没有配置类型检查器，所以不做 Type Check。
+  - `CI result` 汇总上面所有任务，分支保护只需把它设为必需检查。
+- **Codex PR Review**（`.github/workflows/codex-review.yml`）：用 OpenAI Codex 审查 PR 的改动，结果发在 PR 评论里（每次推送更新同一条评论）。审查要求在 `.github/codex/review-prompt.md`，以目标分支上的版本为准。来自 fork 的 PR 不运行。需要仓库 Secret `OPENAI_API_KEY`。
+
+本地跑与 CI 相同的检查（提交前 Claude Code / Codex 也用这两条）：
+
+```
+.venv\Scripts\python .github\scripts\lint.py
+.venv\Scripts\python -m pytest backend\tests
+```
