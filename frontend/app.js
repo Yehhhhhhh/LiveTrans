@@ -241,18 +241,28 @@ const sendConfig = debounce(() => wsSend(asrConfig()), 300);
 // the drop is still transcribed, with its own timestamps. At most RESEND_MAX_S is kept.
 // Positions count samples (16 kHz) since 开始.
 const RESEND_MAX_S = 120;
-const resend = { chunks: [], pos: 0, committed: 0 };
+// A stopped run whose last speech was still being transcribed when 开始 was pressed again keeps
+// its audio here until the backend reports the run done ("run_done"); at most this many runs.
+const STOPPED_RUNS_MAX = 5;
+const newResend = () => ({ chunks: [], pos: 0, committed: 0 });
+let resend = newResend(); // the current run
+const stoppedResend = new Map(); // run -> its buffer, for runs ended with unanswered audio
 
+const unanswered = (buf) => buf.chunks.length > 0 && buf.committed < buf.pos;
+
+// Called by start() before the new run is numbered: keep what the ending run still needs.
 function resetResend() {
-  resend.chunks = [];
-  resend.pos = 0;
-  resend.committed = 0;
+  if (unanswered(resend)) {
+    stoppedResend.set(state.run, resend);
+    while (stoppedResend.size > STOPPED_RUNS_MAX) stoppedResend.delete(stoppedResend.keys().next().value);
+  }
+  resend = newResend();
 }
 
-function trimResend() {
-  const c = resend.chunks;
-  while (c.length && c[0].pos + c[0].pcm.length <= resend.committed) c.shift();
-  while (c.length && resend.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
+function trimResend(buf = resend) {
+  const c = buf.chunks;
+  while (c.length && c[0].pos + c[0].pcm.length <= buf.committed) c.shift();
+  while (c.length && buf.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
 }
 
 function sendAudio(pcm) {
@@ -262,29 +272,51 @@ function sendAudio(pcm) {
   if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(pcm);
 }
 
-function onCommitted(pos) {
-  if (pos <= resend.committed) return;
-  resend.committed = pos;
-  trimResend();
+function onCommitted(pos, run) {
+  const buf = run === state.run ? resend : stoppedResend.get(run);
+  if (!buf || pos <= buf.committed) return;
+  buf.committed = pos;
+  trimResend(buf);
 }
 
-// Called on reconnect while capturing: continue the stream where the backend can pick it up.
-function resumeStream() {
-  const first = resend.chunks[0];
-  const from = Math.max(resend.committed, first ? first.pos : resend.pos);
-  const lost = (from - resend.committed) / 16000;
-  // Same capture run: its results keep the run's clock (start times continue from `from`).
-  wsSend({ type: 'resume', offset: from, run: state.run });
-  resend.committed = from;
+// Continue a run's stream where the backend can pick it up and resend its kept audio. Its
+// results keep the run's clock (start times continue from `from`). Returns seconds resent / lost.
+function resumeStream(buf = resend, run = state.run) {
+  const first = buf.chunks[0];
+  const from = Math.max(buf.committed, first ? first.pos : buf.pos);
+  const lost = (from - buf.committed) / 16000;
+  wsSend({ type: 'resume', offset: from, run });
+  buf.committed = from;
   let sent = 0;
-  for (const ch of resend.chunks) {
+  for (const ch of buf.chunks) {
     if (ch.pos + ch.pcm.length <= from) continue;
     const part = ch.pos >= from ? ch.pcm : ch.pcm.subarray(from - ch.pos);
     state.ws.send(part);
     sent += part.length;
   }
+  return { sent: sent / 16000, lost };
+}
+
+// On reconnect: resend the stopped runs' unanswered speech (each stopped again), then continue
+// the current run, so nothing said around the drop is lost.
+function resumeAll() {
+  const stopped = [...stoppedResend].sort((a, b) => a[0] - b[0]);
+  if (!state.running && !stopped.length && !unanswered(resend)) return;
+  let sent = 0;
+  let lost = 0;
+  const add = (r) => {
+    sent += r.sent;
+    lost += r.lost;
+  };
+  for (const [run, buf] of stopped) {
+    add(resumeStream(buf, run));
+    wsSend({ type: 'stop' });
+  }
+  // Always end on the current run: it makes the backend report the stopped runs done.
+  add(resumeStream());
+  if (!state.running) wsSend({ type: 'stop' });
   if (lost >= 1) showMsg(`断线超过 ${RESEND_MAX_S / 60} 分钟，约 ${Math.round(lost)} 秒语音未能补回`);
-  else if (sent >= 16000) showMsg(`已重新连接，补发断线前后约 ${Math.round(sent / 16000)} 秒语音`);
+  else if (sent >= 1) showMsg(`已重新连接，补发断线前后约 ${Math.round(sent)} 秒语音`);
 }
 
 function connectWs() {
@@ -301,15 +333,7 @@ function connectWs() {
     asrStat.merged = 1;
     showAsr();
     wsSend(asrConfig());
-    if (state.running) {
-      // Reconnected mid-capture: resend what the backend hasn't answered yet.
-      resumeStream();
-    } else if (resend.chunks.length && resend.committed < resend.pos) {
-      // Stopped, but the connection dropped before the last speech was answered: resend it and
-      // end the stream again, so its transcription isn't lost.
-      resumeStream();
-      wsSend({ type: 'stop' });
-    }
+    resumeAll();
   };
 
   ws.onclose = () => {
@@ -325,8 +349,12 @@ function connectWs() {
     } catch {
       return;
     }
-    // Only positions of the current run: an earlier run's would drop this run's kept audio.
-    if (typeof msg.committed === 'number' && msg.committed_run === state.run) onCommitted(msg.committed);
+    // Each position goes to its own run's buffer: an earlier run's would drop this run's audio.
+    if (typeof msg.committed === 'number') onCommitted(msg.committed, msg.committed_run);
+    if (msg.type === 'run_done') {
+      stoppedResend.delete(msg.run);
+      return;
+    }
     if (msg.type === 'status') onStatus(msg);
     else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);

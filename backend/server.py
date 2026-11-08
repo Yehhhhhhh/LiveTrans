@@ -292,14 +292,24 @@ async def ws_audio(ws: WebSocket) -> None:
     # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
     # resends it from the last "committed" position, i.e. the point before which every segment
     # has been answered (or was silence). Positions are samples since the page pressed 开始.
-    stream = {"base": 0}  # position of this connection's first sample (set by "resume")
+    # run -> position of that run's first sample on this connection (set by "resume"). Per run:
+    # a reconnecting page may resend several runs, and a run's segments can still be transcribed
+    # after the next run began.
+    bases: dict[int, int] = {}
     unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
 
     def committed() -> int:
         pos = seg.committed_frames() * FRAME
-        if unsent:
-            pos = min(pos, min(unsent.values()))
-        return stream["base"] + pos
+        mine = [p for (r, _), p in unsent.items() if r == run[0]]
+        if mine:
+            pos = min(pos, min(mine))
+        return bases.get(run[0], 0) + pos
+
+    async def send_run_done(r: int) -> None:
+        # An ended run (开始 pressed again, or the next run resumed) whose segments are all
+        # answered: the page can drop the audio it kept for it.
+        if r != run[0] and not any(k[0] == r for k in unsent):
+            await ws.send_json({"type": "run_done", "run": r})
 
     def commit_info() -> dict:
         # The run the position belongs to: a message sent before a "start" was processed may reach
@@ -338,7 +348,7 @@ async def ws_audio(ws: WebSocket) -> None:
         res.update(
             type="segment",
             index=item.index,
-            start=round(item.start + stream["base"] / 16000, 3),
+            start=round(item.start + bases.get(item.run, 0) / 16000, 3),
             # Sent with the result itself: if the connection drops right after, the page won't
             # resend (and show twice) the audio of a sentence it already has.
             **commit_info(),
@@ -380,6 +390,7 @@ async def ws_audio(ws: WebSocket) -> None:
                 in_hand[0] = len(items) + (carry is not None)
                 try:
                     await transcribe_batch(items)
+                    await send_run_done(items[0].run)
                 finally:
                     in_hand[0] = carry is not None
                 await send_backlog()
@@ -485,12 +496,14 @@ async def ws_audio(ws: WebSocket) -> None:
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
                     # the audio from there; segment start times continue from that position.
+                    old = run[0]
                     r = data.get("run")
                     run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
-                    unsent.clear()
-                    stream["base"] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
+                    bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
+                    if old and old != run[0]:  # 0: no run yet on this connection
+                        await send_run_done(old)
                 elif kind == "stop":
                     close_recording()
                     new = seg.flush()

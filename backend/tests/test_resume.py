@@ -194,6 +194,40 @@ def test_committed_positions_name_their_run(fake):
         assert {m["committed_run"] for m in seen if "committed" in m} == {2}
 
 
+def test_an_answered_run_is_reported_done_when_the_next_one_starts(fake):
+    with session("start", run=1) as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        read_until(sock, lambda m: m["type"] == "segment")
+        sock.send_json({"type": "stop"})
+        sock.send_json({"type": "start", "run": 2})
+        assert read_until(sock, lambda m: m["type"] == "run_done")[-1]["run"] == 1
+
+
+def test_an_ended_run_still_queued_keeps_its_own_positions(fake):
+    """Run 1 (resumed at 10 s) still waits for the model when run 2 starts: its result keeps run 1's
+    clock, run 2's committed position ignores it, and run 1 is reported done once answered."""
+    fake.status = "loading"
+    offset = 10 * 16000
+    with session("resume", offset=offset, run=1) as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        sock.send_json({"type": "stop"})
+        sock.send_json({"type": "start", "run": 2})
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seen = read_until(sock, lambda m: m["type"] == "backlog" and m["pending"] == 2)
+        assert not [m for m in seen if m["type"] == "run_done"]
+        # run 2's first segment starts at 0 and is unanswered: its committed stays at 0, not
+        # at run 1's unanswered position
+        assert [m["committed"] for m in seen if m.get("committed_run") == 2][-1] == 0
+
+        fake.status = "ready"
+        seen = read_until(sock, lambda m: m["type"] == "run_done")
+        first = [m for m in seen if m["type"] == "segment"][0]
+        assert (first["run"], first["start"]) == (1, 10.0)
+        assert seen[-1]["run"] == 1
+        second = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert (second["run"], second["start"]) == (2, 0.0)
+
+
 def test_start_resets_the_offset(fake):
     with session("resume", offset=160000) as sock:
         sock.send_json({"type": "start"})
