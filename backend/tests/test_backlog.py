@@ -1,6 +1,7 @@
 import asyncio
 
 import numpy as np
+import pytest
 
 import server
 from server import MERGE_GAP_S, MERGE_MAX_S, merge_segments, take_batch
@@ -68,3 +69,25 @@ def test_single_segment_is_passed_through():
 def test_merge_threshold_constant():
     # Merging changes language detection granularity; keep it for real backlogs only.
     assert server.MERGE_BACKLOG >= 2
+
+
+def test_batches_never_mix_capture_runs():
+    # 开始 pressed again while segments from the previous run still wait (e.g. model loading).
+    old = [seg(i, 2) for i in (2, 3)]
+    new = [seg(i, 2) for i in (1, 2)]
+    for s in new:
+        s.run = 1
+    q = queue_of(*old, *new)
+    items, carry = take_batch(seg(1, 2), q)
+    assert [(s.run, s.index) for s in items] == [(0, 1), (0, 2), (0, 3)]
+    assert (carry.run, carry.index) == (1, 1)
+    assert merge_segments(items).run == 0
+
+
+def test_duration_spans_the_real_pauses():
+    # Segments at 0-2 s, 5-6 s and 10-12 s: merged audio holds two 0.3 s gaps (4.6 s),
+    # but the batch covers 12 s of the lecture.
+    items = [seg(1, 2, start=0.0), seg(2, 1, start=5.0), seg(3, 2, start=10.0)]
+    assert len(merge_segments(items).audio) / SR == pytest.approx(5 + 2 * MERGE_GAP_S)
+    assert server.span_s(items) == pytest.approx(12.0)
+    assert server.span_s([seg(7, 3, start=4.0)]) == pytest.approx(3.0)

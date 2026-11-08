@@ -187,8 +187,9 @@ VAD_LEVEL_INTERVAL_S = 0.25
 # Catching up: when the final transcriptions fall behind the speaker (slow GPU / CPU), segments
 # that queued up are transcribed together in one pass. Whisper's encoder costs about the same for
 # 1 s or 28 s of audio and dominates the time (beam size barely matters), so 3 segments merged
-# take ~1.3x one segment instead of 3x. Only done once MERGE_BACKLOG segments wait, because a
-# merged pass detects the language once (auto mode) and loses the per-segment split.
+# take ~1.3x one segment instead of 3x. Only done once MERGE_BACKLOG segments wait behind the one
+# about to be transcribed, because a merged pass detects the language once (auto mode) and loses
+# the per-segment split.
 MERGE_BACKLOG = 2
 MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
 MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
@@ -206,12 +207,20 @@ def merge_segments(items: list[Segment]) -> Segment:
         if i:
             parts.append(gap)
         parts.append(s.audio)
-    return Segment(start=items[0].start, audio=np.concatenate(parts), index=items[-1].index)
+    return Segment(start=items[0].start, audio=np.concatenate(parts), index=items[-1].index, run=items[0].run)
+
+
+def span_s(items: list[Segment]) -> float:
+    """Seconds from the first segment's start to the end of the last one's audio: the real time
+    the batch covers (merge_segments' audio has fixed short gaps instead of the real pauses)."""
+    last = items[-1]
+    return last.start + len(last.audio) / 16000 - items[0].start
 
 
 def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Segment | None]:
     """The segments to transcribe next: just `first`, or, when MERGE_BACKLOG or more wait behind it,
-    as many queued ones as fit in MERGE_MAX_S. A taken segment that doesn't fit is returned as carry."""
+    as many queued ones as fit in MERGE_MAX_S. A taken segment that doesn't fit, or that belongs to
+    another capture run (开始 pressed again meanwhile), is returned as carry."""
     items = [first]
     if queue.qsize() < MERGE_BACKLOG:
         return items, None
@@ -219,7 +228,7 @@ def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Seg
     while not queue.empty():
         nxt = queue.get_nowait()
         total += round(MERGE_GAP_S * 16000) + len(nxt.audio)
-        if total > MERGE_MAX_S * 16000:
+        if total > MERGE_MAX_S * 16000 or nxt.run != first.run:
             return items, nxt
         items.append(nxt)
     return items, None
@@ -250,6 +259,7 @@ async def ws_audio(ws: WebSocket) -> None:
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
 
     in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
+    run = [0]  # capture run, bumped by every "start"; tags queued segments (see take_batch)
 
     async def send_backlog() -> None:
         # Segments waiting for (or in) their final transcription; the UI warns when it grows.
@@ -273,7 +283,7 @@ async def ws_audio(ws: WebSocket) -> None:
             type="segment",
             index=item.index,
             start=round(item.start, 3),
-            duration=round(len(item.audio) / 16000, 2),
+            duration=round(span_s(items), 2),
             merged=len(items),
         )
         live["final_sent"] = max(live["final_sent"], item.index)
@@ -378,6 +388,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     rec[0].writeframes(msg["bytes"])
                 new = seg.feed(msg["bytes"])
                 for s in new:
+                    s.run = run[0]
                     queue.put_nowait(s)
                 if new:
                     await send_backlog()
@@ -403,12 +414,14 @@ async def ws_audio(ws: WebSocket) -> None:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
                 elif kind == "start":
+                    run[0] += 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                 elif kind == "stop":
                     close_recording()
                     new = seg.flush()
                     for s in new:
+                        s.run = run[0]
                         queue.put_nowait(s)
                     if new:
                         await send_backlog()
