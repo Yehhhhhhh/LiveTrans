@@ -27,7 +27,8 @@
 
 name: Codex PR Review
 # Fixed format: AGENTS.md counts manual re-reviews of a PR by this title.
-run-name: Codex review of PR #${{ github.event.pull_request.number || inputs.pr_number }}
+# Quoted: unquoted, YAML would treat " #..." as a comment and drop the number.
+run-name: "Codex review of PR #${{ github.event.pull_request.number || inputs.pr_number }}"
 
 on:
   pull_request:
