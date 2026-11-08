@@ -130,3 +130,22 @@ def test_worker_survives_an_unexpected_error(fake, monkeypatch):
         seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
         assert seg["index"] == 2
         assert seg["text"] == "testo 1"
+
+
+def test_results_carry_their_capture_run_after_a_restart(fake):
+    """Speech of run 1 still queued when run 2 starts is transcribed and labelled as run 1."""
+    with session() as sock:
+        sock.send_json({"type": "start", "run": 1})
+        sock.send_bytes(b"\0" * 3200)
+        read_until(sock, lambda m: m["type"] == "backlog" and m["pending"] == 1)
+        sock.send_json({"type": "stop"})
+        sock.send_json({"type": "start", "run": 2})
+        sock.send_bytes(b"\0" * 3200)
+        read_until(sock, lambda m: m["type"] == "backlog" and m["pending"] == 2)
+
+        fake.status = "ready"
+        segs = []
+        for _ in range(2):
+            segs.append(read_until(sock, lambda m: m["type"] == "segment")[-1])
+        # Never merged across runs, and each result names its own run.
+        assert [(s["run"], s["merged"]) for s in segs] == [(1, 1), (2, 1)]
