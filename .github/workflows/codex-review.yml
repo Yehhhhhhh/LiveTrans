@@ -1,0 +1,180 @@
+# Independent code review of every pull request by OpenAI Codex
+# (https://github.com/openai/codex-action), posted as a single PR comment that is
+# updated on each new push.
+#
+# Security model:
+# - Trigger is `pull_request`, never `pull_request_target`: the PR's code never runs
+#   with this repository's secrets or a write token.
+# - PRs from forks are skipped (GitHub withholds secrets from them anyway), as are
+#   Dependabot PRs. Only branches pushed to this repository get a review.
+# - The `review` job holds OPENAI_API_KEY but only `contents: read`; Codex runs in
+#   the read-only permission profile with the default `drop-sudo` safety strategy,
+#   as the job's last step. The `comment` job holds the write token but no secret
+#   and never checks out or runs PR code.
+# - The review instructions are read from the base branch, so a PR can't rewrite
+#   its own review prompt. PR title/body are passed to Codex marked as untrusted.
+#
+# Setup: add the repository secret OPENAI_API_KEY. Optional repository variables:
+#   CODEX_MODEL             model name passed to Codex (empty = Codex default)
+#   CODEX_ALLOW_BOT_USERS   comma-separated bot accounts allowed to trigger a review,
+#                           e.g. "claude[bot]" if the Claude GitHub app opens PRs
+
+name: Codex PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+# One review per PR at a time; a new push cancels the review of the older commit.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Codex review
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    # Not ubuntu-latest: on the Ubuntu 26.04 image the action's default drop-sudo
+    # strategy fails ("runner is not a member of the sudo group",
+    # https://github.com/openai/codex-action/issues/188). Move back to ubuntu-latest
+    # once that is fixed, rather than weakening safety-strategy.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - name: Check OPENAI_API_KEY is configured
+        env:
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: |
+          if [[ "$HAS_KEY" != "true" ]]; then
+            echo "::error title=OPENAI_API_KEY missing::Add an OpenAI API key as the repository secret OPENAI_API_KEY (Settings > Secrets and variables > Actions > New repository secret), then re-run this workflow."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          # The merge commit is what would land on the base branch.
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          # Full history so Codex can run `git log` / `git diff` between base and head.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch base and head of the PR
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin \
+            "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr-head"
+
+      - name: Build review prompt
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prompt="$RUNNER_TEMP/codex-review-prompt.md"
+          src=".github/codex/review-prompt.md"
+          # Use the base branch's copy; fall back to the PR's copy only when the base
+          # doesn't have one yet (the PR that introduces this workflow).
+          if git cat-file -e "origin/$PR_BASE_REF:$src" 2>/dev/null; then
+            git show "origin/$PR_BASE_REF:$src" > "$prompt"
+          else
+            echo "::warning::$src not on $PR_BASE_REF yet; using the PR's copy."
+            cat "$src" > "$prompt"
+          fi
+          {
+            echo
+            echo "Repository: $REPO, pull request #$PR_NUMBER"
+            echo "BASE_SHA: $BASE_SHA"
+            echo "HEAD_SHA: $HEAD_SHA"
+            echo
+            echo "----- BEGIN UNTRUSTED PR TITLE AND DESCRIPTION -----"
+            printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY"
+            echo "----- END UNTRUSTED PR TITLE AND DESCRIPTION -----"
+          } >> "$prompt"
+          echo "PROMPT_FILE=$prompt" >> "$GITHUB_ENV"
+          echo "Commits under review:"
+          git log --oneline "$BASE_SHA..$HEAD_SHA"
+
+      # Must stay the last step of this job (see codex-action docs/security.md).
+      - name: Run Codex
+        id: run_codex
+        # Pinned to the commit behind the v1 tag (2026-10-05): this step holds the API key,
+        # so a moved tag must not change what runs. Bump deliberately.
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ env.PROMPT_FILE }}
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          model: ${{ vars.CODEX_MODEL }}
+          allow-bot-users: ${{ vars.CODEX_ALLOW_BOT_USERS }}
+
+  comment:
+    name: Post review comment
+    needs: review
+    # Runs after a successful or failed review, not when the review was skipped
+    # (fork / Dependabot PR) or cancelled by a newer push.
+    if: always() && (needs.review.result == 'success' || needs.review.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Create or update the Codex review comment
+        uses: actions/github-script@v7
+        env:
+          REVIEW_RESULT: ${{ needs.review.result }}
+          CODEX_FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const marker = '<!-- codex-pr-review -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sha = process.env.HEAD_SHA.slice(0, 7);
+            const message = (process.env.CODEX_FINAL_MESSAGE || '').trim();
+            const ok = process.env.REVIEW_RESULT === 'success' && message !== '';
+
+            let body;
+            if (ok) {
+              const max = 60000; // GitHub's comment limit is 65536 characters
+              const text = message.length > max
+                ? message.slice(0, max) + `\n\n…(truncated, full output in the [workflow run](${runUrl}))`
+                : message;
+              body = `${marker}\n## Codex review of ${sha}\n\n${text}\n\n---\n<sub>Automated review by OpenAI Codex · [run log](${runUrl})</sub>`;
+            } else {
+              const why = process.env.REVIEW_RESULT === 'success'
+                ? 'Codex finished without producing a review.'
+                : 'The Codex review job failed.';
+              body = `${marker}\n## Codex review of ${sha}: not available\n\n${why} See the [run log](${runUrl}) for the failing step (a missing \`OPENAI_API_KEY\` secret is reported there by name).`;
+              core.error(`${why} ${runUrl}`);
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              core.info(`Updated comment ${existing.html_url}`);
+            } else {
+              const { data } = await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info(`Created comment ${data.html_url}`);
+            }
+            await core.summary.addRaw(body.replace(marker, '')).write();
+            if (!ok) core.setFailed(body.split('\n')[1]);

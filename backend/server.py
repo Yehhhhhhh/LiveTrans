@@ -55,6 +55,21 @@ transcriber = Transcriber()
 translator: Translator | None = None
 vad_model: SileroModel | None = None
 gpu_lock = asyncio.Lock()
+
+
+async def to_thread_to_end(fn, *args):
+    """asyncio.to_thread for Whisper calls made under gpu_lock.
+
+    A thread can't be cancelled. If the awaiting task is (the page disconnected), keep waiting
+    until the thread has really finished before passing the cancellation on, so the caller's
+    `async with gpu_lock` holds the lock until then and the next call can't overlap it on the GPU.
+    """
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        raise
 clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
@@ -193,8 +208,9 @@ VAD_LEVEL_INTERVAL_S = 0.25
 # Catching up: when the final transcriptions fall behind the speaker (slow GPU / CPU), segments
 # that queued up are transcribed together in one pass. Whisper's encoder costs about the same for
 # 1 s or 28 s of audio and dominates the time (beam size barely matters), so 3 segments merged
-# take ~1.3x one segment instead of 3x. Only done once MERGE_BACKLOG segments wait, because a
-# merged pass detects the language once (auto mode) and loses the per-segment split.
+# take ~1.3x one segment instead of 3x. Only done once MERGE_BACKLOG segments wait behind the one
+# about to be transcribed, because a merged pass detects the language once (auto mode) and loses
+# the per-segment split.
 MERGE_BACKLOG = 2
 MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
 MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
@@ -212,12 +228,20 @@ def merge_segments(items: list[Segment]) -> Segment:
         if i:
             parts.append(gap)
         parts.append(s.audio)
-    return Segment(start=items[0].start, audio=np.concatenate(parts), index=items[-1].index)
+    return Segment(start=items[0].start, audio=np.concatenate(parts), index=items[-1].index, run=items[0].run)
+
+
+def span_s(items: list[Segment]) -> float:
+    """Seconds from the first segment's start to the end of the last one's audio: the real time
+    the batch covers (merge_segments' audio has fixed short gaps instead of the real pauses)."""
+    last = items[-1]
+    return last.start + len(last.audio) / 16000 - items[0].start
 
 
 def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Segment | None]:
     """The segments to transcribe next: just `first`, or, when MERGE_BACKLOG or more wait behind it,
-    as many queued ones as fit in MERGE_MAX_S. A taken segment that doesn't fit is returned as carry."""
+    as many queued ones as fit in MERGE_MAX_S. A taken segment that doesn't fit, or that belongs to
+    another capture run (开始 pressed again meanwhile), is returned as carry."""
     items = [first]
     if queue.qsize() < MERGE_BACKLOG:
         return items, None
@@ -225,7 +249,7 @@ def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Seg
     while not queue.empty():
         nxt = queue.get_nowait()
         total += round(MERGE_GAP_S * 16000) + len(nxt.audio)
-        if total > MERGE_MAX_S * 16000:
+        if total > MERGE_MAX_S * 16000 or nxt.run != first.run:
             return items, nxt
         items.append(nxt)
     return items, None
@@ -256,12 +280,13 @@ async def ws_audio(ws: WebSocket) -> None:
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
 
     in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
+    run = [0]  # capture run, bumped by every "start"; tags queued segments (see take_batch)
 
     # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
     # resends it from the last "committed" position, i.e. the point before which every segment
     # has been answered (or was silence). Positions are samples since the page pressed 开始.
     stream = {"base": 0}  # position of this connection's first sample (set by "resume")
-    unsent: dict[int, int] = {}  # segment index -> start position, queued but not answered yet
+    unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
 
     def committed() -> int:
         pos = seg.committed_frames() * FRAME
@@ -283,7 +308,7 @@ async def ws_audio(ws: WebSocket) -> None:
         item = merge_segments(items)
         try:
             async with gpu_lock:
-                res = await asyncio.to_thread(
+                res = await to_thread_to_end(
                     transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
                 )
         except Exception as e:  # noqa: BLE001
@@ -299,7 +324,7 @@ async def ws_audio(ws: WebSocket) -> None:
             # Sent with the result itself: if the connection drops right after, the page won't
             # resend (and show twice) the audio of a sentence it already has.
             committed=committed(),
-            duration=round(len(item.audio) / 16000, 2),
+            duration=round(span_s(items), 2),
             merged=len(items),
         )
         live["final_sent"] = max(live["final_sent"], item.index)
@@ -312,7 +337,7 @@ async def ws_audio(ws: WebSocket) -> None:
 
     def answered(items: list[Segment]) -> None:
         for it in items:
-            unsent.pop(it.index, None)
+            unsent.pop((it.run, it.index), None)
 
     async def wait_for_model() -> None:
         # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
@@ -360,7 +385,7 @@ async def ws_audio(ws: WebSocket) -> None:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
-                text = await asyncio.to_thread(partial_job, audio, index)
+                text = await to_thread_to_end(partial_job, audio, index)
             if text and index > live["final_sent"]:
                 await ws.send_json({"type": "partial", "index": index, "text": text})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
@@ -408,7 +433,8 @@ async def ws_audio(ws: WebSocket) -> None:
                     rec[0].writeframes(msg["bytes"])
                 new = seg.feed(msg["bytes"])
                 for s in new:
-                    unsent[s.index] = round(s.start * 16000)
+                    s.run = run[0]
+                    unsent[(s.run, s.index)] = round(s.start * 16000)
                     queue.put_nowait(s)
                 if new:
                     await send_backlog()
@@ -439,6 +465,7 @@ async def ws_audio(ws: WebSocket) -> None:
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
                     # the audio from there; segment start times continue from that position.
+                    run[0] += 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                     unsent.clear()
@@ -447,7 +474,8 @@ async def ws_audio(ws: WebSocket) -> None:
                     close_recording()
                     new = seg.flush()
                     for s in new:
-                        unsent[s.index] = round(s.start * 16000)
+                        s.run = run[0]
+                        unsent[(s.run, s.index)] = round(s.start * 16000)
                         queue.put_nowait(s)
                     if new:
                         await send_backlog()

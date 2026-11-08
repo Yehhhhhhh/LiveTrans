@@ -108,7 +108,7 @@
 - VAD 看到的音频会自动放大音量（最多 20 倍），轻声、远距离的讲课也能检测到；送给 Whisper 的仍是原始音频。
 - 浏览器自带的麦克风降噪 / 自动增益默认关闭（它会把远处的人声当成噪音去掉），可在「设置 → 音频」中开启。
 - 长时间上课时定期重置 VAD 状态，避免越到后面越检测不到人声。
-- 识别跟不上说话速度时（显卡慢、显存被其他程序占用或用 CPU），状态栏「识别」会变黄，并显示「待识别 N 段」。积压达到 2 段时，排队的几段会合并成一次识别来追赶（最长 24 秒）。Whisper 每次识别的耗时主要是固定开销，实测合并 3 段只比识别 1 段多花约三成时间。自动语种模式下，合并的几段共用一个语种。
+- 识别跟不上说话速度时（显卡慢、显存被其他程序占用或用 CPU），状态栏「识别」会变黄，并显示「待识别 N 段」。正在识别的那段后面又排了 2 段或以上时，排队的几段会合并成一次识别来追赶（最长 24 秒），追上后黄色提示自动消失。Whisper 每次识别的耗时主要是固定开销，实测合并 3 段只比识别 1 段多花约三成时间。自动语种模式下，合并的几段共用一个语种。
 - 模型还在加载（首次启动要下载）时就点了「开始」，说的话也不会丢：语音先排队，模型就绪后再一起识别。
 - 过滤 Whisper 幻觉：连续重复的词句会合并，只有套话（如「Grazie a tutti」「Thank you」）、只在复读术语表提示、或可信度过低的段落会被丢弃。
 
@@ -164,4 +164,22 @@ frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB
 frontend/vendor/katex/ KaTeX 公式渲染（离线）
 install.bat            创建 .venv 并安装依赖
 start.bat              启动后端，就绪后打开页面
+```
+
+## 持续集成（GitHub Actions）
+
+每个 Pull Request 创建或更新时自动运行两个工作流：
+
+- **CI**（`.github/workflows/ci.yml`）
+  - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、`.bat` 必须是纯 ASCII + CRLF。
+  - Build & Test（Windows、Python 3.12）：按 install.bat 的方式安装依赖，检查 `import server`，有 `backend/tests` 时运行 pytest。
+  - 项目没有配置类型检查器，所以不做 Type Check。
+  - `CI result` 汇总上面所有任务，分支保护只需把它设为必需检查。
+- **Codex PR Review**（`.github/workflows/codex-review.yml`）：用 OpenAI Codex 审查 PR 的改动，结果发在 PR 评论里（每次推送更新同一条评论）。审查要求在 `.github/codex/review-prompt.md`，以目标分支上的版本为准。来自 fork 的 PR 不运行。需要仓库 Secret `OPENAI_API_KEY`。
+
+本地跑与 CI 相同的检查（提交前 Claude Code / Codex 也用这两条）：
+
+```
+.venv\Scripts\python .github\scripts\lint.py
+.venv\Scripts\python -m pytest backend\tests
 ```
