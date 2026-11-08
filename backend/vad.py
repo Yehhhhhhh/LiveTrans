@@ -88,6 +88,7 @@ class Segment:
     start: float  # seconds since stream start
     audio: np.ndarray  # float32 mono 16 kHz
     index: int  # increments per segment; ties live partials to their final result
+    run: int = 0  # capture run (开始 … 停止) it belongs to; batches never mix runs
 
 
 class Segmenter:

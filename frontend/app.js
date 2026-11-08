@@ -276,6 +276,7 @@ function connectWs() {
     }
     else if (msg.type === 'backlog') {
       asrStat.pending = msg.pending;
+      if (!msg.pending) asrStat.merged = 1; // caught up: the merge note no longer applies
       showAsr();
     } else if (msg.type === 'error') showMsg(msg.message);
   };
