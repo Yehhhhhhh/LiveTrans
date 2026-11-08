@@ -38,7 +38,11 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: on the Ubuntu 26.04 image the action's default drop-sudo
+    # strategy fails ("runner is not a member of the sudo group",
+    # https://github.com/openai/codex-action/issues/188). Move back to ubuntu-latest
+    # once that is fixed, rather than weakening safety-strategy.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
