@@ -58,3 +58,13 @@ def test_real_speech_survives():
     prompt = "Lezione di economia / Economics lecture. inflazione, PIL."
     text = "Oggi parliamo di inflazione e di come cambia il potere d'acquisto."
     assert clean_text(text, prompt) == text
+
+
+def test_hint_alone_without_glossary_terms():
+    # Empty glossary (or 用术语表提示识别 off): app.js sends "<hint>. " alone.
+    prompt = "Lezione di economia / Economics lecture. "
+    hint, terms = split_prompt(prompt)
+    assert hint == {"lezione", "di", "economia", "economics", "lecture"}
+    assert terms == set()
+    assert clean_text("Economics lecture.", prompt) == ""
+    assert clean_text("Oggi parliamo di inflazione.", prompt) == "Oggi parliamo di inflazione."

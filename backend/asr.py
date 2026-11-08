@@ -115,7 +115,8 @@ def split_prompt(prompt: str) -> tuple[set[str], set[str]]:
 
     app.js builds the prompt as "<course hint>. <term>, <term>, ..." (the hint is set in
     设置 → 识别, default "Lezione di telecomunicazioni / Telecommunications lecture"), or just
-    "<term>, <term>, ..." when the hint is empty: the hint is everything before the first ". ".
+    "<term>, <term>, ..." when the hint is empty, or "<course hint>. " when there are no terms:
+    the hint is everything before the first ". ".
     """
     if not prompt:
         return set(), set()

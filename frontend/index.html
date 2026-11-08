@@ -154,7 +154,7 @@
       <label class="field">单段最长 (秒) <input id="vadMax" type="number" step="1" min="3" max="20"></label>
       <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
       <label class="field">识别提示语 <input id="asrHint" type="text" maxlength="150" placeholder="例如 Lezione di economia / Economics lecture"></label>
-      <p class="hint">用讲课的语言写一句课程名称，和术语表一起提示 Whisper，提高专业词识别率；可留空。</p>
+      <p class="hint">用讲课的语言写一句课程名称，放在术语表前面一起提示 Whisper，提高专业词识别率；术语表为空或关闭时也会单独发送。留空则不发送。</p>
       <label class="row"><input type="checkbox" id="asrPartial"> 说话时逐词实时显示（句子结束后替换为精确结果）</label>
       <p class="hint">句末静音越短，出字越快但句子越碎；超过单段最长会在短停顿处或强制切分。</p>
     </section>

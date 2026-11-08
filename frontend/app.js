@@ -172,7 +172,12 @@ async function ensureGlossary() {
 // Whisper prompt: newest (user-added) terms first, within a character budget
 // so the 224-token prompt window isn't overflowed.
 function buildAsrPrompt() {
-  if (!settings.asr.glossaryPrompt || !glossary) return '';
+  // Format "<hint>. <term>, <term>.", or "<hint>. " alone when there are no terms (empty glossary,
+  // or 用术语表提示识别 off): the backend reads the hint as the text before the first ". "
+  // (asr.split_prompt) to spot Whisper reciting it. An empty hint leaves just the terms.
+  const hint = (settings.asr.hint || '').trim().replace(/[\s.]+$/, '');
+  const head = hint ? `${hint}. ` : '';
+  if (!settings.asr.glossaryPrompt || !glossary) return head;
   const seen = new Set();
   const terms = [];
   let len = 0;
@@ -185,11 +190,7 @@ function buildAsrPrompt() {
       len += k.length + 2;
     }
   }
-  if (!terms.length) return '';
-  // Format "<hint>. <term>, <term>.": the backend reads the hint as the text before the first ". "
-  // (asr.split_prompt) to spot Whisper reciting it.
-  const hint = (settings.asr.hint || '').trim().replace(/[\s.]+$/, '');
-  return `${hint ? `${hint}. ` : ''}${terms.join(', ')}.`;
+  return terms.length ? `${head}${terms.join(', ')}.` : head;
 }
 
 function escapeRe(s) {
