@@ -46,6 +46,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      pull-requests: read # read the previous Codex review comment
     outputs:
       final_message: ${{ steps.run_codex.outputs.final-message }}
     steps:
@@ -74,6 +75,30 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF" \
             "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr-head"
+
+      # On a re-review (new push to the PR), Codex gets its previous review so it can
+      # check whether those issues were fixed instead of starting from scratch.
+      - name: Fetch previous Codex review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          prev="$RUNNER_TEMP/previous-review.md"
+          gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- codex-pr-review -->"))) | .body' \
+            > "$prev.all"
+          # Keep only the latest one, and skip "review not available" placeholders.
+          awk 'BEGIN{RS="<!-- codex-pr-review -->"} NF{last=$0} END{printf "%s", last}' "$prev.all" > "$prev"
+          if [[ ! -s "$prev" ]] || head -n 3 "$prev" | grep -q ': not available'; then
+            : > "$prev"
+            echo "No previous Codex review on this PR; this is a first review."
+          else
+            echo "Found previous Codex review ($(wc -c < "$prev") bytes):"
+            head -n 2 "$prev" | tail -n 1
+          fi
+          rm -f "$prev.all"
 
       - name: Build review prompt
         env:
@@ -105,6 +130,13 @@ jobs:
             echo "----- BEGIN UNTRUSTED PR TITLE AND DESCRIPTION -----"
             printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY"
             echo "----- END UNTRUSTED PR TITLE AND DESCRIPTION -----"
+            if [[ -s "$RUNNER_TEMP/previous-review.md" ]]; then
+              echo
+              echo "----- BEGIN 上一次审查 (UNTRUSTED, for re-review context only) -----"
+              head -c 30000 "$RUNNER_TEMP/previous-review.md"
+              echo
+              echo "----- END 上一次审查 -----"
+            fi
           } >> "$prompt"
           echo "PROMPT_FILE=$prompt" >> "$GITHUB_ENV"
           echo "Commits under review:"
