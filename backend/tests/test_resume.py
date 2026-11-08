@@ -181,6 +181,19 @@ def test_resume_after_stop_transcribes_the_resent_audio(fake):
         assert seg["committed"] == offset + CHUNK
 
 
+def test_committed_positions_name_their_run(fake):
+    """The page ignores positions of an earlier run, so each one says which run it belongs to."""
+    with session("start", run=1) as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seen = read_until(sock, lambda m: m["type"] == "segment")
+        seen += read_until(sock, lambda m: m["type"] == "backlog" and m["pending"] == 0)
+        assert {m["committed_run"] for m in seen if "committed" in m} == {1}
+        sock.send_json({"type": "start", "run": 2})
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seen = read_until(sock, lambda m: m["type"] == "segment")
+        assert {m["committed_run"] for m in seen if "committed" in m} == {2}
+
+
 def test_start_resets_the_offset(fake):
     with session("resume", offset=160000) as sock:
         sock.send_json({"type": "start"})

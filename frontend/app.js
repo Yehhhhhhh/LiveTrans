@@ -325,7 +325,8 @@ function connectWs() {
     } catch {
       return;
     }
-    if (typeof msg.committed === 'number') onCommitted(msg.committed);
+    // Only positions of the current run: an earlier run's would drop this run's kept audio.
+    if (typeof msg.committed === 'number' && msg.committed_run === state.run) onCommitted(msg.committed);
     if (msg.type === 'status') onStatus(msg);
     else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);

@@ -301,10 +301,15 @@ async def ws_audio(ws: WebSocket) -> None:
             pos = min(pos, min(unsent.values()))
         return stream["base"] + pos
 
+    def commit_info() -> dict:
+        # The run the position belongs to: a message sent before a "start" was processed may reach
+        # the page after it started the new run, and must not move that run's resend cursor.
+        return {"committed": committed(), "committed_run": run[0]}
+
     async def send_backlog() -> None:
         # Segments waiting for (or in) their final transcription; the UI warns when it grows.
         await ws.send_json(
-            {"type": "backlog", "pending": queue.qsize() + in_hand[0], "committed": committed()}
+            {"type": "backlog", "pending": queue.qsize() + in_hand[0], **commit_info()}
         )
 
     async def transcribe_batch(items: list[Segment]) -> None:
@@ -336,7 +341,7 @@ async def ws_audio(ws: WebSocket) -> None:
             start=round(item.start + stream["base"] / 16000, 3),
             # Sent with the result itself: if the connection drops right after, the page won't
             # resend (and show twice) the audio of a sentence it already has.
-            committed=committed(),
+            **commit_info(),
             duration=round(span_s(items), 2),
             merged=len(items),
             run=item.run,
@@ -463,7 +468,7 @@ async def ws_audio(ws: WebSocket) -> None:
                         "type": "vad",
                         "speaking": speaking,
                         "prob": round(seg.take_peak_prob(), 2),
-                        "committed": committed(),
+                        **commit_info(),
                     })
                 maybe_partial()
             elif msg.get("text"):
