@@ -152,7 +152,7 @@ start.bat              启动后端，就绪后打开页面
 
 ## 持续集成（GitHub Actions）
 
-每个 Pull Request 创建或更新时自动运行两个工作流：
+Pull Request 上有两个工作流：CI 在每次创建或更新时都运行；Codex PR Review 只在创建时自动运行一次，之后手动触发。
 
 - **CI**（`.github/workflows/ci.yml`）
   - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、`.bat` 必须是纯 ASCII + CRLF。
