@@ -68,6 +68,8 @@ const state = {
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
   streamStartWall: 0,
+  run: 0, // capture run sent with every 'start'; the backend echoes it in its results
+  runWall: new Map(), // run -> its streamStartWall, for results of a run that already ended
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
@@ -248,8 +250,7 @@ function connectWs() {
     wsSend(asrConfig());
     if (state.running) {
       // Backend restarted mid-capture: restart its stream clock.
-      wsSend({ type: 'start' });
-      state.streamStartWall = Date.now();
+      startRun();
     }
   };
 
@@ -284,6 +285,17 @@ function connectWs() {
   };
 }
 
+// A new capture run on the backend, with its own stream clock. Runs stopped earlier may still be
+// transcribing (model loading, backlog): their results keep their own clock and stay out of the
+// current run's live state.
+function startRun() {
+  state.run += 1;
+  state.streamStartWall = Date.now();
+  state.runWall.set(state.run, state.streamStartWall);
+  for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
+  wsSend({ type: 'start', run: state.run });
+}
+
 function onStatus(msg) {
   const el = $('stModel');
   if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
@@ -296,13 +308,20 @@ function onStatus(msg) {
 
 async function onSegment(msg) {
   const text = (msg.text || '').trim();
-  // Partials of earlier segments can no longer be finalized.
-  transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
-    if (Number(el.dataset.pidx) < msg.index) el.remove();
-  });
+  // A result of an earlier run: its indices don't refer to the current run's partials.
+  const current = msg.run === undefined || msg.run === state.run;
+  const wall = current ? state.streamStartWall : state.runWall.get(msg.run) ?? state.streamStartWall;
+  if (current) {
+    // Partials of earlier segments can no longer be finalized.
+    transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
+      if (Number(el.dataset.pidx) < msg.index) el.remove();
+    });
+  }
   if (!text || !state.session) {
-    if (live.index <= msg.index) resetLive();
-    partialEl(msg.index)?.remove();
+    if (current) {
+      if (live.index <= msg.index) resetLive();
+      partialEl(msg.index)?.remove();
+    }
     return;
   }
   // One line per sentence; timestamps are spread over the segment by text length.
@@ -313,7 +332,7 @@ async function onSegment(msg) {
     const seg = {
       id: crypto.randomUUID(),
       sessionId: state.session.id,
-      ts: state.streamStartWall + (msg.start + (msg.duration * offset) / total) * 1000,
+      ts: wall + (msg.start + (msg.duration * offset) / total) * 1000,
       lang: msg.lang,
       text: s,
       translation: '',
@@ -326,11 +345,11 @@ async function onSegment(msg) {
   asrStat.ms = msg.asr_ms;
   asrStat.merged = msg.merged || 1;
   showAsr();
-  if (settings.tr.enabled) takeLive(segs, msg.index);
+  if (settings.tr.enabled && current) takeLive(segs, msg.index);
   if (segs.some((s) => s.trStatus === 'done')) {
     setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
   }
-  let prev = partialEl(msg.index);
+  let prev = current ? partialEl(msg.index) : null;
   segs.forEach((seg, i) => {
     state.segments.push(seg);
     prev = i === 0 ? renderSeg(seg, prev) : renderSeg(seg, null, prev);
@@ -1057,8 +1076,7 @@ async function start() {
   resetLive();
   transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
   wsSend(asrConfig());
-  wsSend({ type: 'start' });
-  state.streamStartWall = Date.now();
+  startRun();
   $('startBtn').textContent = '停止';
   $('startBtn').classList.add('running');
   if (src !== 'system') listMics();
