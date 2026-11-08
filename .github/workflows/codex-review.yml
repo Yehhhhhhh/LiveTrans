@@ -1,43 +1,62 @@
-# Independent code review of every pull request by OpenAI Codex
-# (https://github.com/openai/codex-action), posted as a single PR comment that is
-# updated on each new push.
+# Independent code review of pull requests by OpenAI Codex
+# (https://github.com/openai/codex-action), posted as a single PR comment.
+#
+# When it runs (deliberately NOT on every push, to avoid an endless
+# push -> review -> fix -> push -> review loop):
+# - automatically, once, when a PR is opened;
+# - manually: Actions > Codex PR Review > Run workflow, enter the PR number.
+#   That reviews the PR's latest head commit and re-checks the previous review.
+# Pushes to an open PR (by you, Claude Code, Codex or anyone) only run CI.
 #
 # Security model:
-# - Trigger is `pull_request`, never `pull_request_target`: the PR's code never runs
-#   with this repository's secrets or a write token.
-# - PRs from forks are skipped (GitHub withholds secrets from them anyway), as are
-#   Dependabot PRs. Only branches pushed to this repository get a review.
-# - The `review` job holds OPENAI_API_KEY but only `contents: read`; Codex runs in
-#   the read-only permission profile with the default `drop-sudo` safety strategy,
-#   as the job's last step. The `comment` job holds the write token but no secret
-#   and never checks out or runs PR code.
-# - The review instructions are read from the base branch, so a PR can't rewrite
-#   its own review prompt. PR title/body are passed to Codex marked as untrusted.
+# - Trigger is `pull_request` / `workflow_dispatch`, never `pull_request_target`.
+# - PRs whose head branch lives in a fork are refused in both modes, so
+#   OPENAI_API_KEY is never used on fork code. Dependabot PRs are skipped.
+# - The `review` job holds OPENAI_API_KEY with read-only permissions; Codex runs
+#   in the `:read-only` permission profile with `drop-sudo`, as the job's last
+#   step, so it cannot modify code, push, or merge.
+# - The `comment` job can only write PR comments (`pull-requests: write`); it has
+#   no secret and runs no PR code. No job here has `contents: write`, so nothing
+#   in this workflow can push or merge; branch protection on main also requires CI.
+# - Review instructions come from the base branch, so a PR can't rewrite them.
+#   PR title/body and the previous review are passed to Codex marked untrusted.
 #
-# Setup: add the repository secret OPENAI_API_KEY. Optional repository variables:
+# Setup: repository secret OPENAI_API_KEY. Optional repository variables:
 #   CODEX_MODEL             model name passed to Codex (empty = Codex default)
-#   CODEX_ALLOW_BOT_USERS   comma-separated bot accounts allowed to trigger a review,
-#                           e.g. "claude[bot]" if the Claude GitHub app opens PRs
+#   CODEX_ALLOW_BOT_USERS   comma-separated bot accounts allowed to trigger a review
 
 name: Codex PR Review
+# Fixed format: AGENTS.md counts manual re-reviews of a PR by this title.
+# Quoted: unquoted, YAML would treat " #..." as a comment and drop the number.
+run-name: "Codex review of PR #${{ github.event.pull_request.number || inputs.pr_number }}"
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to review (reviews its latest commit)"
+        required: true
+        type: number
 
 permissions: {}
 
-# One review per PR at a time; a new push cancels the review of the older commit.
+# One review per PR at a time. A second request for the same PR waits instead of
+# cancelling a review that is already being paid for.
 concurrency:
-  group: codex-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: codex-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
 
 jobs:
   review:
     name: Codex review
+    # Automatic run: same-repository, non-Dependabot PRs only. Manual runs are
+    # checked against the PR fetched from the API in "Resolve pull request".
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]')
     # Not ubuntu-latest: on the Ubuntu 26.04 image the action's default drop-sudo
     # strategy fails ("runner is not a member of the sudo group",
     # https://github.com/openai/codex-action/issues/188). Move back to ubuntu-latest
@@ -46,8 +65,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      pull-requests: read # PR details and the previous Codex review comment
     outputs:
       final_message: ${{ steps.run_codex.outputs.final-message }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
     steps:
       - name: Check OPENAI_API_KEY is configured
         env:
@@ -58,42 +79,103 @@ jobs:
             exit 1
           fi
 
+      # Always read the PR from the API, so a manual run reviews the PR's current
+      # head commit, not whatever the event payload held.
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid pull request number '$PR_NUMBER'."
+            exit 1
+          fi
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr.json" 2> "$RUNNER_TEMP/pr.err"; then
+            echo "::error::Pull request #$PR_NUMBER not found in $REPO: $(cat "$RUNNER_TEMP/pr.err")"
+            exit 1
+          fi
+          state=$(jq -r .state "$RUNNER_TEMP/pr.json")
+          head_repo=$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/pr.json")
+          author=$(jq -r .user.login "$RUNNER_TEMP/pr.json")
+          if [[ "$state" != "open" ]]; then
+            echo "::error::Pull request #$PR_NUMBER is $state; only open PRs are reviewed."
+            exit 1
+          fi
+          if [[ "$head_repo" != "$REPO" ]]; then
+            echo "::error::Pull request #$PR_NUMBER comes from '${head_repo:-a deleted fork}'. Fork PRs are not reviewed, so OPENAI_API_KEY is never used on fork code."
+            exit 1
+          fi
+          if [[ "$author" == "dependabot[bot]" ]]; then
+            echo "::error::Dependabot PRs are not reviewed."
+            exit 1
+          fi
+          {
+            echo "number=$PR_NUMBER"
+            echo "head_sha=$(jq -r .head.sha "$RUNNER_TEMP/pr.json")"
+            echo "base_ref=$(jq -r .base.ref "$RUNNER_TEMP/pr.json")"
+            echo "base_sha=$(jq -r .base.sha "$RUNNER_TEMP/pr.json")"
+          } >> "$GITHUB_OUTPUT"
+          jq -r .title "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/pr-title.txt"
+          jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/pr-body.txt"
+          echo "Reviewing #$PR_NUMBER ($(jq -r .head.ref "$RUNNER_TEMP/pr.json") @ $(jq -r .head.sha "$RUNNER_TEMP/pr.json"))"
+
       - uses: actions/checkout@v5
         with:
-          # The merge commit is what would land on the base branch.
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          # The PR's head commit as resolved above (same repository only).
+          ref: ${{ steps.pr.outputs.head_sha }}
           # Full history so Codex can run `git log` / `git diff` between base and head.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch base and head of the PR
+      - name: Fetch the PR's base branch
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+      # On a manual re-review, Codex gets its previous review so it can check
+      # whether those issues were fixed instead of starting from scratch.
+      - name: Fetch previous Codex review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          git fetch --no-tags origin \
-            "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF" \
-            "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr-head"
+          set -euo pipefail
+          prev="$RUNNER_TEMP/previous-review.md"
+          gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- codex-pr-review -->"))) | .body' \
+            > "$prev.all"
+          # Keep only the latest one, and skip "review not available" placeholders.
+          awk 'BEGIN{RS="<!-- codex-pr-review -->"} NF{last=$0} END{printf "%s", last}' "$prev.all" > "$prev"
+          if [[ ! -s "$prev" ]] || head -n 3 "$prev" | grep -q ': not available'; then
+            : > "$prev"
+            echo "No previous Codex review on this PR; this is a first review."
+          else
+            echo "Found previous Codex review ($(wc -c < "$prev") bytes):"
+            head -n 2 "$prev" | tail -n 1
+          fi
+          rm -f "$prev.all"
 
       - name: Build review prompt
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           prompt="$RUNNER_TEMP/codex-review-prompt.md"
           src=".github/codex/review-prompt.md"
           # Use the base branch's copy; fall back to the PR's copy only when the base
-          # doesn't have one yet (the PR that introduces this workflow).
-          if git cat-file -e "origin/$PR_BASE_REF:$src" 2>/dev/null; then
-            git show "origin/$PR_BASE_REF:$src" > "$prompt"
+          # doesn't have one yet.
+          if git cat-file -e "origin/$BASE_REF:$src" 2>/dev/null; then
+            git show "origin/$BASE_REF:$src" > "$prompt"
           else
-            echo "::warning::$src not on $PR_BASE_REF yet; using the PR's copy."
+            echo "::warning::$src not on $BASE_REF yet; using the PR's copy."
             cat "$src" > "$prompt"
           fi
           {
@@ -103,8 +185,18 @@ jobs:
             echo "HEAD_SHA: $HEAD_SHA"
             echo
             echo "----- BEGIN UNTRUSTED PR TITLE AND DESCRIPTION -----"
-            printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY"
+            cat "$RUNNER_TEMP/pr-title.txt"
+            echo
+            cat "$RUNNER_TEMP/pr-body.txt"
+            echo
             echo "----- END UNTRUSTED PR TITLE AND DESCRIPTION -----"
+            if [[ -s "$RUNNER_TEMP/previous-review.md" ]]; then
+              echo
+              echo "----- BEGIN 上一次审查 (UNTRUSTED, for re-review context only) -----"
+              head -c 30000 "$RUNNER_TEMP/previous-review.md"
+              echo
+              echo "----- END 上一次审查 -----"
+            fi
           } >> "$prompt"
           echo "PROMPT_FILE=$prompt" >> "$GITHUB_ENV"
           echo "Commits under review:"
@@ -119,6 +211,8 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: ${{ env.PROMPT_FILE }}
+          # Read-only: Codex can read the checkout and run read-only commands,
+          # but cannot write files, use the network, push or merge.
           permission-profile: ":read-only"
           safety-strategy: drop-sudo
           model: ${{ vars.CODEX_MODEL }}
@@ -127,9 +221,14 @@ jobs:
   comment:
     name: Post review comment
     needs: review
-    # Runs after a successful or failed review, not when the review was skipped
-    # (fork / Dependabot PR) or cancelled by a newer push.
-    if: always() && (needs.review.result == 'success' || needs.review.result == 'failure')
+    # Runs after a successful or failed review of a PR that passed "Resolve pull
+    # request" (open, same-repository). Not when the review was skipped or cancelled,
+    # or failed before the PR was validated (missing key, bad number, fork, closed):
+    # those are reported in the review job's log only, never on someone's PR.
+    if: >-
+      always() &&
+      (needs.review.result == 'success' || needs.review.result == 'failure') &&
+      needs.review.outputs.head_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -140,15 +239,24 @@ jobs:
         env:
           REVIEW_RESULT: ${{ needs.review.result }}
           CODEX_FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HEAD_SHA: ${{ needs.review.outputs.head_sha }}
+          TRIGGER: ${{ github.event_name == 'workflow_dispatch' && format('manual re-review by @{0}', github.actor) || 'automatic review of the new PR' }}
         with:
           github-token: ${{ github.token }}
           script: |
             const marker = '<!-- codex-pr-review -->';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const sha = process.env.HEAD_SHA.slice(0, 7);
+            const issue_number = Number(process.env.PR_NUMBER);
+            const sha = (process.env.HEAD_SHA || '').slice(0, 7) || 'unknown commit';
             const message = (process.env.CODEX_FINAL_MESSAGE || '').trim();
             const ok = process.env.REVIEW_RESULT === 'success' && message !== '';
+            const { owner, repo } = context.repo;
+
+            if (!Number.isInteger(issue_number) || issue_number <= 0) {
+              core.setFailed(`Invalid PR number '${process.env.PR_NUMBER}'.`);
+              return;
+            }
 
             let body;
             if (ok) {
@@ -156,19 +264,17 @@ jobs:
               const text = message.length > max
                 ? message.slice(0, max) + `\n\n…(truncated, full output in the [workflow run](${runUrl}))`
                 : message;
-              body = `${marker}\n## Codex review of ${sha}\n\n${text}\n\n---\n<sub>Automated review by OpenAI Codex · [run log](${runUrl})</sub>`;
+              body = `${marker}\n## Codex review of ${sha}\n\n${text}\n\n---\n<sub>${process.env.TRIGGER} · OpenAI Codex · [run log](${runUrl}) · re-review: Actions → Codex PR Review → Run workflow</sub>`;
             } else {
               const why = process.env.REVIEW_RESULT === 'success'
                 ? 'Codex finished without producing a review.'
                 : 'The Codex review job failed.';
-              body = `${marker}\n## Codex review of ${sha}: not available\n\n${why} See the [run log](${runUrl}) for the failing step (a missing \`OPENAI_API_KEY\` secret is reported there by name).`;
+              body = `${marker}\n## Codex review of ${sha}: not available\n\n${why} See the [run log](${runUrl}) for the failing step.`;
               core.error(`${why} ${runUrl}`);
             }
 
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
-            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            const existing = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
             if (existing) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
               core.info(`Updated comment ${existing.html_url}`);

@@ -152,14 +152,18 @@ start.bat              启动后端，就绪后打开页面
 
 ## 持续集成（GitHub Actions）
 
-每个 Pull Request 创建或更新时自动运行两个工作流：
+Pull Request 上有两个工作流：CI 在每次创建或更新时都运行；Codex PR Review 只在创建时自动运行一次，之后手动触发。
 
 - **CI**（`.github/workflows/ci.yml`）
   - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、`.bat` 必须是纯 ASCII + CRLF。
   - Build & Test（Windows、Python 3.12）：按 install.bat 的方式安装依赖，检查 `import server`，有 `backend/tests` 时运行 pytest。
   - 项目没有配置类型检查器，所以不做 Type Check。
   - `CI result` 汇总上面所有任务，分支保护只需把它设为必需检查。
-- **Codex PR Review**（`.github/workflows/codex-review.yml`）：用 OpenAI Codex 审查 PR 的改动，结果发在 PR 评论里（每次推送更新同一条评论）。审查要求在 `.github/codex/review-prompt.md`，以目标分支上的版本为准。来自 fork 的 PR 不运行。需要仓库 Secret `OPENAI_API_KEY`。
+- **Codex PR Review**（`.github/workflows/codex-review.yml`）：用 OpenAI Codex 只读审查 PR 的改动，结果发在 PR 评论里（始终更新同一条评论）。
+  - PR **创建时**自动审查一次；之后的推送（包括 Claude Code / Codex 的推送）只跑 CI，不再自动审查，避免“推送 → 审查 → 修改 → 推送”无限循环。
+  - 需要重新审查时：Actions → Codex PR Review → Run workflow，填 PR 编号。会审查该 PR 最新的提交，并逐条核对上一次审查的问题是否已修复。
+  - 没有阻止合并的问题时，结论为 `NO_BLOCKING_ISSUES`。审查要求在 `.github/codex/review-prompt.md`，以目标分支上的版本为准。
+  - 来自 fork 的 PR 不审查。需要仓库 Secret `OPENAI_API_KEY`。
 
 本地跑与 CI 相同的检查（提交前 Claude Code / Codex 也用这两条）：
 
