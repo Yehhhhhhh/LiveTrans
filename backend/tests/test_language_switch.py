@@ -113,3 +113,30 @@ def test_resending_the_same_mode_keeps_the_cached_language(fake):
         sock.send_json({"type": "config", "asr": {"language": "it_en", "partial": True}})
         assert next_partial(sock) == "[it]"
         assert len(fake.detections) == 1
+
+
+def test_mode_change_during_an_in_flight_partial(fake):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    plain = fake.pick_language
+
+    def slow_first_detection(audio, among=("it", "en")):
+        if not started.is_set():
+            started.set()
+            release.wait(5)  # still detecting under it_en while the mode changes
+        return plain(audio, among)
+
+    fake.pick_language = slow_first_detection
+    with session() as sock:
+        sock.send_json({"type": "config", "asr": {"language": "it_en", "partial": True}})
+        sock.send_json({"type": "start"})
+        sock.send_bytes(b"\0" * 3200)
+        assert started.wait(5)
+        sock.send_json({"type": "config", "asr": {"language": "any", "partial": True}})
+        time.sleep(0.1)  # the config is applied before the detection finishes
+        release.set()
+        # The stale "[it]" partial is dropped and doesn't re-fill the cache:
+        # the next partial detects again among all languages.
+        assert next_partial(sock) == "[zh]"
+        assert fake.detections == [("it", "en"), None]
