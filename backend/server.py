@@ -238,16 +238,28 @@ async def ws_audio(ws: WebSocket) -> None:
             log.info("[%s %.2fs %dms] %s", res["lang"], res["duration"], res["asr_ms"], res["text"])
             await ws.send_json(res)
 
+    # Bumped whenever the recognition language mode changes. A partial that started under an
+    # older mode (it runs in a worker thread) neither caches the language it detected nor shows
+    # its text. lang_lock keeps the mode, its generation and the cache consistent across threads.
+    mode_gen = [0]
+    lang_lock = threading.Lock()
+
     def partial_job(audio, index: int) -> str:
-        lang = opts["language"]
+        with lang_lock:
+            gen, lang = mode_gen[0], opts["language"]
+            cached = live["lang"] if live["lang_index"] == index else ""
         if not is_fixed(lang):
-            if live["lang_index"] == index and live["lang"]:
-                lang = live["lang"]
+            if cached:
+                lang = cached
             else:
                 lang, _ = transcriber.pick_language(audio, detect_among(lang))
                 if len(audio) >= PARTIAL_LANG_LOCK_S * 16000:
-                    live["lang_index"], live["lang"] = index, lang
-        return transcriber.transcribe_partial(audio, lang, opts["prompt"])
+                    with lang_lock:
+                        if mode_gen[0] == gen:
+                            live["lang_index"], live["lang"] = index, lang
+        text = transcriber.transcribe_partial(audio, lang, opts["prompt"])
+        with lang_lock:
+            return text if mode_gen[0] == gen else ""
 
     async def run_partial(audio, index: int) -> None:
         try:
@@ -316,10 +328,13 @@ async def ws_audio(ws: WebSocket) -> None:
                     apply_config(seg, asr)
                     mode = normalize_language(asr.get("language"))
                     if mode and mode != opts["language"]:
-                        opts["language"] = mode
                         # The language detected for the segment in progress was chosen under the
-                        # old mode: detect again for its next partials.
-                        live.update(lang_index=0, lang="")
+                        # old mode: detect again for its next partials, and drop partials still
+                        # running under the old mode (see partial_job).
+                        with lang_lock:
+                            opts["language"] = mode
+                            mode_gen[0] += 1
+                            live.update(lang_index=0, lang="")
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
