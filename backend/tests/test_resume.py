@@ -168,6 +168,19 @@ def test_resume_continues_positions_and_timestamps(fake):
         assert seg["committed"] == offset + CHUNK
 
 
+def test_resume_after_stop_transcribes_the_resent_audio(fake):
+    """A page that stopped before its last speech was answered resumes the same run, resends that
+    audio and stops again: the speech is transcribed with that run's positions."""
+    offset = 5 * 16000
+    with session("resume", offset=offset, run=3) as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        sock.send_json({"type": "stop"})
+        seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
+        assert seg["run"] == 3
+        assert seg["start"] == 5.0
+        assert seg["committed"] == offset + CHUNK
+
+
 def test_start_resets_the_offset(fake):
     with session("resume", offset=160000) as sock:
         sock.send_json({"type": "start"})

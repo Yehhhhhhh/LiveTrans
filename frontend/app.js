@@ -273,6 +273,7 @@ function resumeStream() {
   const first = resend.chunks[0];
   const from = Math.max(resend.committed, first ? first.pos : resend.pos);
   const lost = (from - resend.committed) / 16000;
+  // Same capture run: its results keep the run's clock (start times continue from `from`).
   wsSend({ type: 'resume', offset: from, run: state.run });
   resend.committed = from;
   let sent = 0;
@@ -303,6 +304,11 @@ function connectWs() {
     if (state.running) {
       // Reconnected mid-capture: resend what the backend hasn't answered yet.
       resumeStream();
+    } else if (resend.chunks.length && resend.committed < resend.pos) {
+      // Stopped, but the connection dropped before the last speech was answered: resend it and
+      // end the stream again, so its transcription isn't lost.
+      resumeStream();
+      wsSend({ type: 'stop' });
     }
   };
 
