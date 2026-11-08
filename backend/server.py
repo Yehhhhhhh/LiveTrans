@@ -51,6 +51,21 @@ transcriber = Transcriber()
 translator: Translator | None = None
 vad_model: SileroModel | None = None
 gpu_lock = asyncio.Lock()
+
+
+async def to_thread_to_end(fn, *args):
+    """asyncio.to_thread for Whisper calls made under gpu_lock.
+
+    A thread can't be cancelled. If the awaiting task is (the page disconnected), keep waiting
+    until the thread has really finished before passing the cancellation on, so the caller's
+    `async with gpu_lock` holds the lock until then and the next call can't overlap it on the GPU.
+    """
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        raise
 clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
@@ -272,7 +287,7 @@ async def ws_audio(ws: WebSocket) -> None:
         item = merge_segments(items)
         try:
             async with gpu_lock:
-                res = await asyncio.to_thread(
+                res = await to_thread_to_end(
                     transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
                 )
         except Exception as e:  # noqa: BLE001
@@ -340,7 +355,7 @@ async def ws_audio(ws: WebSocket) -> None:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
-                text = await asyncio.to_thread(partial_job, audio, index)
+                text = await to_thread_to_end(partial_job, audio, index)
             if text and index > live["final_sent"]:
                 await ws.send_json({"type": "partial", "index": index, "text": text})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
