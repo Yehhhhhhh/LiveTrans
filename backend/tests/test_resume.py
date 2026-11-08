@@ -175,3 +175,43 @@ def test_start_resets_the_offset(fake):
         seg = read_until(sock, lambda m: m["type"] == "segment")[-1]
         assert seg["start"] == 0.0
         assert seg["committed"] == CHUNK
+
+
+class FlakyTranscriber(FakeTranscriber):
+    def __init__(self, failures):
+        super().__init__("ready")
+        self.failures = failures
+        self.calls = 0
+
+    def transcribe(self, audio, language="auto", prompt=""):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("CUDA error: transient")
+        return super().transcribe(audio, language, prompt)
+
+
+def test_transient_failure_is_retried_and_the_audio_stays_uncommitted(fake, monkeypatch):
+    t = FlakyTranscriber(failures=1)
+    monkeypatch.setattr(server, "transcriber", t)
+    monkeypatch.setattr(server, "TRANSCRIBE_RETRY_S", 0.05, raising=False)
+    with session() as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        seen = read_until(sock, lambda m: m["type"] in ("segment", "error"))
+        assert seen[-1]["type"] == "segment"  # recovered, no error shown
+        assert t.calls == 2
+        # until it was answered, the page was never told to drop that audio
+        assert all(m["committed"] == 0 for m in seen[:-1] if "committed" in m)
+        assert seen[-1]["committed"] == CHUNK
+
+
+def test_persistent_failure_gives_up_after_the_last_attempt(fake, monkeypatch):
+    t = FlakyTranscriber(failures=99)
+    monkeypatch.setattr(server, "transcriber", t)
+    monkeypatch.setattr(server, "TRANSCRIBE_RETRY_S", 0.01, raising=False)
+    with session() as sock:
+        sock.send_bytes(b"\0" * (CHUNK * 2))
+        err = read_until(sock, lambda m: m["type"] == "error")[-1]
+        assert "识别出错" in err["message"]
+        assert t.calls == server.TRANSCRIBE_ATTEMPTS
+        # given up: the next status moves committed past it
+        assert read_until(sock, lambda m: m["type"] == "backlog")[-1]["committed"] == CHUNK

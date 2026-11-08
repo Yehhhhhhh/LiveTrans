@@ -216,6 +216,10 @@ MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
 MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
 # While the Whisper model is still loading, queued speech waits; status is checked this often.
 MODEL_WAIT_POLL_S = 0.2
+# A failed final transcription is retried this many times in all, this long apart, before its
+# audio is given up (and stops being kept for resending, see ws_audio).
+TRANSCRIBE_ATTEMPTS = 3
+TRANSCRIBE_RETRY_S = 1.0
 
 
 def merge_segments(items: list[Segment]) -> Segment:
@@ -306,16 +310,22 @@ async def ws_audio(ws: WebSocket) -> None:
             await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
             return
         item = merge_segments(items)
-        try:
-            async with gpu_lock:
-                res = await to_thread_to_end(
-                    transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
-                )
-        except Exception as e:  # noqa: BLE001
-            log.exception("Transcription failed")
-            answered(items)
-            await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
-            return
+        # Answering a batch advances "committed", and the page then drops the kept audio. So a
+        # failure (e.g. a transient CUDA error) is retried before the batch is given up.
+        for attempt in range(1, TRANSCRIBE_ATTEMPTS + 1):
+            try:
+                async with gpu_lock:
+                    res = await to_thread_to_end(
+                        transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
+                    )
+                break
+            except Exception as e:  # noqa: BLE001
+                log.exception("Transcription failed (attempt %d of %d)", attempt, TRANSCRIBE_ATTEMPTS)
+                if attempt == TRANSCRIBE_ATTEMPTS:
+                    answered(items)
+                    await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
+                    return
+                await asyncio.sleep(TRANSCRIBE_RETRY_S)
         answered(items)
         res.update(
             type="segment",
