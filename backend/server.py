@@ -284,7 +284,10 @@ async def ws_audio(ws: WebSocket) -> None:
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
 
     in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
-    run = [0]  # capture run, bumped by every "start"; tags queued segments (see take_batch)
+    # Capture run, set by every "start" (the page numbers its runs); tags queued segments (see
+    # take_batch) and is echoed in their results, so a run that is still being transcribed after
+    # 开始 was pressed again keeps its own time base on the page and can't touch the new run's state.
+    run = [0]
 
     # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
     # resends it from the last "committed" position, i.e. the point before which every segment
@@ -336,8 +339,10 @@ async def ws_audio(ws: WebSocket) -> None:
             committed=committed(),
             duration=round(span_s(items), 2),
             merged=len(items),
+            run=item.run,
         )
-        live["final_sent"] = max(live["final_sent"], item.index)
+        if item.run == run[0]:  # an older run's indices mean nothing for the current one
+            live["final_sent"] = max(live["final_sent"], item.index)
         log.info(
             "[%s %.2fs %dms%s] %s",
             res["lang"], res["duration"], res["asr_ms"],
@@ -475,7 +480,8 @@ async def ws_audio(ws: WebSocket) -> None:
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
                     # the audio from there; segment start times continue from that position.
-                    run[0] += 1
+                    r = data.get("run")
+                    run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                     unsent.clear()
