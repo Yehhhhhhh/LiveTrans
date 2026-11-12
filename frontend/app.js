@@ -9,11 +9,22 @@ const DEFAULTS = {
   micDeviceId: '',
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
-  asr: { language: 'auto', vadThreshold: 0.5, minSilenceMs: 600, maxSegmentS: 8, glossaryPrompt: true, partial: true },
+  asr: {
+    language: 'it_en',
+    lastOther: 'fr',
+    vadThreshold: 0.5,
+    minSilenceMs: 600,
+    maxSegmentS: 8,
+    glossaryPrompt: true,
+    // Course name in the lecture's language, put before the glossary terms in the Whisper prompt.
+    hint: 'Lezione di telecomunicazioni / Telecommunications lecture',
+    partial: true,
+  },
   tr: {
     enabled: true,
     live: true,
     useLocal: false, // overrides provider with the local Ollama model
+    domain: '通信工程', // course domain named in the translation prompt; '' = unspecified
     local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
     provider: 'openai',
     contextSize: 3,
@@ -55,6 +66,8 @@ function saveJson(key, value) {
 
 const settings = deepMerge(DEFAULTS, loadJson('livetrans.settings'));
 const saveSettings = () => saveJson('livetrans.settings', settings);
+// Before "自动（所有语言）" existed, "auto" meant Italian / English: keep what it did.
+if (settings.asr.language === 'auto') settings.asr.language = 'it_en';
 
 let glossary = loadJson('livetrans.glossary');
 const saveGlossary = () => saveJson('livetrans.glossary', glossary);
@@ -68,10 +81,12 @@ const state = {
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
   streamStartWall: 0,
+  run: 0, // capture run sent with every 'start'; the backend echoes it in its results
+  runWall: new Map(), // run -> its streamStartWall, for results of a run that already ended
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
-  trBusy: false,
+  trActive: 0, // final translations in flight
   wakeLock: null,
 };
 
@@ -91,6 +106,22 @@ function showVad(msg) {
   }
   setPill(el, text, msg.speaking ? 'speaking' : '');
   el.title = '人声概率高于阈值才会开始识别。老师说话时人声值总低于阈值，就把「语音判定阈值」调低一些。';
+}
+
+// Time of the last final transcription, plus the backlog once the GPU falls behind the speaker
+// (pending counts the segment being transcribed, so 1 is normal).
+const asrStat = { ms: null, merged: 1, pending: 0 };
+function showAsr() {
+  const el = $('stAsr');
+  let text = asrStat.ms == null ? '识别：-' : `识别：${asrStat.ms} ms`;
+  if (asrStat.merged > 1) text += ` · 合并 ${asrStat.merged} 段追赶`;
+  const behind = asrStat.pending >= 2;
+  if (behind) text += ` · 待识别 ${asrStat.pending} 段`;
+  const warn = behind || asrStat.merged > 1;
+  setPill(el, text, warn ? 'warn' : asrStat.ms == null ? '' : 'ok');
+  el.title = warn
+    ? '识别速度跟不上说话速度，字幕会滞后。积压时自动把排队的几段合并成一次识别来追赶进度（自动语种时合并的几段共用一个语种）。经常出现可在「设置 → 识别」关闭逐词实时显示，或换用更小的模型。'
+    : '';
 }
 
 // Messages pop up as a toast at the top centre. They fade after a while, except the
@@ -159,7 +190,12 @@ async function ensureGlossary() {
 // Whisper prompt: newest (user-added) terms first, within a character budget
 // so the 224-token prompt window isn't overflowed.
 function buildAsrPrompt() {
-  if (!settings.asr.glossaryPrompt || !glossary) return '';
+  // Format "<hint>. <term>, <term>.", or "<hint>. " alone when there are no terms (empty glossary,
+  // or 用术语表提示识别 off): the backend reads the hint as the text before the first ". "
+  // (asr.split_prompt) to spot Whisper reciting it. An empty hint leaves just the terms.
+  const hint = (settings.asr.hint || '').trim().replace(/[\s.]+$/, '');
+  const head = hint ? `${hint}. ` : '';
+  if (!settings.asr.glossaryPrompt || !glossary) return head;
   const seen = new Set();
   const terms = [];
   let len = 0;
@@ -172,7 +208,7 @@ function buildAsrPrompt() {
       len += k.length + 2;
     }
   }
-  return terms.length ? `Lezione di telecomunicazioni / Telecommunications lecture. ${terms.join(', ')}.` : '';
+  return terms.length ? `${head}${terms.join(', ')}.` : head;
 }
 
 function escapeRe(s) {
@@ -216,6 +252,91 @@ function wsSend(obj) {
 
 const sendConfig = debounce(() => wsSend(asrConfig()), 300);
 
+// Resuming after a dropped connection (backend restarted, network blip). Audio sent to the
+// backend is kept until the backend reports it "committed": every segment in it answered, or
+// silence. Audio captured while the connection is down is kept as well. On reconnect the stream
+// resumes at the committed position and the kept audio is sent again, so what was said around
+// the drop is still transcribed, with its own timestamps. At most RESEND_MAX_S is kept.
+// Positions count samples (16 kHz) since 开始.
+const RESEND_MAX_S = 120;
+// A stopped run whose last speech was still being transcribed when 开始 was pressed again keeps
+// its audio here until the backend reports the run done ("run_done"); at most this many runs.
+const STOPPED_RUNS_MAX = 5;
+const newResend = () => ({ chunks: [], pos: 0, committed: 0 });
+let resend = newResend(); // the current run
+const stoppedResend = new Map(); // run -> its buffer, for runs ended with unanswered audio
+
+const unanswered = (buf) => buf.chunks.length > 0 && buf.committed < buf.pos;
+
+// Called by start() before the new run is numbered: keep what the ending run still needs.
+function resetResend() {
+  if (unanswered(resend)) {
+    stoppedResend.set(state.run, resend);
+    while (stoppedResend.size > STOPPED_RUNS_MAX) stoppedResend.delete(stoppedResend.keys().next().value);
+  }
+  resend = newResend();
+}
+
+function trimResend(buf = resend) {
+  const c = buf.chunks;
+  while (c.length && c[0].pos + c[0].pcm.length <= buf.committed) c.shift();
+  while (c.length && buf.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
+}
+
+function sendAudio(pcm) {
+  resend.chunks.push({ pos: resend.pos, pcm });
+  resend.pos += pcm.length;
+  trimResend();
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(pcm);
+}
+
+function onCommitted(pos, run) {
+  const buf = run === state.run ? resend : stoppedResend.get(run);
+  if (!buf || pos <= buf.committed) return;
+  buf.committed = pos;
+  trimResend(buf);
+}
+
+// Continue a run's stream where the backend can pick it up and resend its kept audio. Its
+// results keep the run's clock (start times continue from `from`). Returns seconds resent / lost.
+function resumeStream(buf = resend, run = state.run) {
+  const first = buf.chunks[0];
+  const from = Math.max(buf.committed, first ? first.pos : buf.pos);
+  const lost = (from - buf.committed) / 16000;
+  wsSend({ type: 'resume', offset: from, run });
+  buf.committed = from;
+  let sent = 0;
+  for (const ch of buf.chunks) {
+    if (ch.pos + ch.pcm.length <= from) continue;
+    const part = ch.pos >= from ? ch.pcm : ch.pcm.subarray(from - ch.pos);
+    state.ws.send(part);
+    sent += part.length;
+  }
+  return { sent: sent / 16000, lost };
+}
+
+// On reconnect: resend the stopped runs' unanswered speech (each stopped again), then continue
+// the current run, so nothing said around the drop is lost.
+function resumeAll() {
+  const stopped = [...stoppedResend].sort((a, b) => a[0] - b[0]);
+  if (!state.running && !stopped.length && !unanswered(resend)) return;
+  let sent = 0;
+  let lost = 0;
+  const add = (r) => {
+    sent += r.sent;
+    lost += r.lost;
+  };
+  for (const [run, buf] of stopped) {
+    add(resumeStream(buf, run));
+    wsSend({ type: 'stop' });
+  }
+  // Always end on the current run: it makes the backend report the stopped runs done.
+  add(resumeStream());
+  if (!state.running) wsSend({ type: 'stop' });
+  if (lost >= 1) showMsg(`断线超过 ${RESEND_MAX_S / 60} 分钟，约 ${Math.round(lost)} 秒语音未能补回`);
+  else if (sent >= 1) showMsg(`已重新连接，补发断线前后约 ${Math.round(sent)} 秒语音`);
+}
+
 function connectWs() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
@@ -224,17 +345,20 @@ function connectWs() {
   ws.onopen = () => {
     state.wsReady = true;
     setPill($('stWs'), '后端：已连接', 'ok');
+    // A new connection starts with an empty queue (a dropped one's backlog is gone),
+    // so neither the backlog nor the last merge note applies any more.
+    asrStat.pending = 0;
+    asrStat.merged = 1;
+    showAsr();
     wsSend(asrConfig());
-    if (state.running) {
-      // Backend restarted mid-capture: restart its stream clock.
-      wsSend({ type: 'start' });
-      state.streamStartWall = Date.now();
-    }
+    resumeAll();
+    loadOtherLangs(); // in case the backend wasn't up when the page loaded
   };
 
   ws.onclose = () => {
     state.wsReady = false;
     setPill($('stWs'), '后端：未连接，重连中…', 'err');
+    clearLiveLines();
     setTimeout(connectWs, 2000);
   };
 
@@ -243,6 +367,12 @@ function connectWs() {
     try {
       msg = JSON.parse(ev.data);
     } catch {
+      return;
+    }
+    // Each position goes to its own run's buffer: an earlier run's would drop this run's audio.
+    if (typeof msg.committed === 'number') onCommitted(msg.committed, msg.committed_run);
+    if (msg.type === 'run_done') {
+      stoppedResend.delete(msg.run);
       return;
     }
     if (msg.type === 'status') onStatus(msg);
@@ -255,8 +385,23 @@ function connectWs() {
       if (live.index === msg.index) resetLive();
       partialEl(msg.index)?.remove();
     }
-    else if (msg.type === 'error') showMsg(msg.message);
+    else if (msg.type === 'backlog') {
+      asrStat.pending = msg.pending;
+      if (!msg.pending) asrStat.merged = 1; // caught up: the merge note no longer applies
+      showAsr();
+    } else if (msg.type === 'error') showMsg(msg.message);
   };
+}
+
+// A new capture run on the backend, with its own stream clock. Runs stopped earlier may still be
+// transcribing (model loading, backlog): their results keep their own clock and stay out of the
+// current run's live state.
+function startRun() {
+  state.run += 1;
+  state.streamStartWall = Date.now();
+  state.runWall.set(state.run, state.streamStartWall);
+  for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
+  wsSend({ type: 'start', run: state.run });
 }
 
 function onStatus(msg) {
@@ -271,13 +416,20 @@ function onStatus(msg) {
 
 async function onSegment(msg) {
   const text = (msg.text || '').trim();
-  // Partials of earlier segments can no longer be finalized.
-  transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
-    if (Number(el.dataset.pidx) < msg.index) el.remove();
-  });
+  // A result of an earlier run: its indices don't refer to the current run's partials.
+  const current = msg.run === undefined || msg.run === state.run;
+  const wall = current ? state.streamStartWall : state.runWall.get(msg.run) ?? state.streamStartWall;
+  if (current) {
+    // Partials of earlier segments can no longer be finalized.
+    transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
+      if (Number(el.dataset.pidx) < msg.index) el.remove();
+    });
+  }
   if (!text || !state.session) {
-    if (live.index <= msg.index) resetLive();
-    partialEl(msg.index)?.remove();
+    if (current) {
+      if (live.index <= msg.index) resetLive();
+      partialEl(msg.index)?.remove();
+    }
     return;
   }
   // One line per sentence; timestamps are spread over the segment by text length.
@@ -288,7 +440,7 @@ async function onSegment(msg) {
     const seg = {
       id: crypto.randomUUID(),
       sessionId: state.session.id,
-      ts: state.streamStartWall + (msg.start + (msg.duration * offset) / total) * 1000,
+      ts: wall + (msg.start + (msg.duration * offset) / total) * 1000,
       lang: msg.lang,
       text: s,
       translation: '',
@@ -298,12 +450,14 @@ async function onSegment(msg) {
     offset += s.length;
     return seg;
   });
-  setPill($('stAsr'), `识别：${msg.asr_ms} ms`, 'ok');
-  if (settings.tr.enabled) takeLive(segs, msg.index);
+  asrStat.ms = msg.asr_ms;
+  asrStat.merged = msg.merged || 1;
+  showAsr();
+  if (settings.tr.enabled && current) takeLive(segs, msg.index);
   if (segs.some((s) => s.trStatus === 'done')) {
     setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
   }
-  let prev = partialEl(msg.index);
+  let prev = current ? partialEl(msg.index) : null;
   segs.forEach((seg, i) => {
     state.segments.push(seg);
     prev = i === 0 ? renderSeg(seg, prev) : renderSeg(seg, null, prev);
@@ -336,15 +490,26 @@ function enqueueTranslation(seg) {
   pumpTranslations();
 }
 
-async function pumpTranslations() {
-  if (state.trBusy) return;
-  state.trBusy = true;
-  while (state.trQueue.length) {
+// Final translations run several at a time, so one slow reply doesn't hold up every line after
+// it. Each line fills in as soon as its own translation is done; a request that starts while
+// earlier lines are still being translated gets their source text as context (see contextFor).
+// The local model runs one at a time: it shares the GPU with Whisper, and Ollama would queue
+// parallel requests anyway unless configured otherwise.
+const TR_PARALLEL_API = 2;
+const trParallel = () => (settings.tr.useLocal ? 1 : TR_PARALLEL_API);
+const trBusy = () => state.trActive > 0 || state.trQueue.length > 0;
+
+function pumpTranslations() {
+  while (state.trQueue.length && state.trActive < trParallel()) {
     const seg = state.trQueue.shift();
-    await translateSeg(seg);
+    state.trActive++;
+    translateSeg(seg).finally(() => {
+      state.trActive--;
+      pumpTranslations();
+    });
   }
-  state.trBusy = false;
-  pumpLive();
+  // Live drafts only run while no final translation is waiting.
+  if (!trBusy()) pumpLive();
 }
 
 function translationRequest(text, context) {
@@ -355,6 +520,7 @@ function translationRequest(text, context) {
     text,
     context,
     glossary: relevantGlossary([text, ...context.map((c) => c.src)]),
+    domain: (settings.tr.domain || '').trim(),
   };
 }
 
@@ -388,17 +554,18 @@ async function postTranslate(body, onText = () => {}, signal = undefined) {
   }
 }
 
-// Context: the previous translated segments of the same session (all of the
-// current session's when seg is null, i.e. for the segment still being spoken).
+// Context: the previous segments of the same session (all of the current session's when seg is
+// null, i.e. for the segment still being spoken). Translated ones come with their translation;
+// ones still being translated (translations run in parallel) with their source text only.
 async function contextFor(seg) {
   const list = !seg || seg.sessionId === state.session?.id ? state.segments : await db.getSegments(seg.sessionId);
   const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
   const n = Number(settings.tr.contextSize) || 0;
   return list
     .slice(0, idx < 0 ? list.length : idx)
-    .filter((s) => s.trStatus === 'done')
+    .filter((s) => s.trStatus === 'done' || s.trStatus === 'pending' || s.trStatus === 'streaming')
     .slice(-n)
-    .map((s) => ({ src: s.text, tgt: s.translation }));
+    .map((s) => ({ src: s.text, tgt: s.trStatus === 'done' ? s.translation : '' }));
 }
 
 async function translateSeg(seg) {
@@ -449,7 +616,8 @@ const newLive = (index) => ({
   sentences: [],
   done: new Map(), // sentence text -> translation
   failed: new Set(), // sentence texts not to retry; the final pass still follows
-  shown: [], // per sentence position: the finished draft on screen  req: null,
+  shown: [], // per sentence position: the finished draft on screen
+  req: null, // the draft translation request in flight
 });
 let live = newLive(-1);
 // Partials drop Whisper's closing period, so it's ignored when matching sentences.
@@ -479,7 +647,7 @@ function showLive() {
 
 function pumpLive() {
   // Final translations go first; this runs again when their queue drains.
-  if (live.req || state.trBusy) return;
+  if (live.req || trBusy()) return;
   const pos = live.sentences.findIndex((s) => s && !live.done.has(liveKey(s)) && !live.failed.has(liveKey(s)));
   if (pos < 0) return;
   const text = live.sentences[pos];
@@ -550,6 +718,15 @@ transcriptEl.addEventListener('scroll', () => {
 $('jumpBtn').onclick = () => {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 };
+
+// When the connection drops, the backend loses the segment being spoken (and its queue),
+// and the next connection numbers segments from 1 again: live lines left over from the old
+// connection would never be finalized or removed, so they go now, with their live translation.
+function clearLiveLines() {
+  resetLive();
+  transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
+  $('emptyHint').classList.toggle('hidden', transcriptEl.querySelector('.seg') !== null);
+}
 
 // The live line of the segment being spoken: words pop in as Whisper hears them.
 function partialEl(index) {
@@ -1020,7 +1197,7 @@ async function start() {
 
   const meter = $('meterBar');
   node.port.onmessage = (e) => {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(e.data.pcm.buffer);
+    sendAudio(e.data.pcm);
     meter.style.width = `${Math.min(100, e.data.rms * 400)}%`;
   };
 
@@ -1030,8 +1207,8 @@ async function start() {
   resetLive();
   transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
   wsSend(asrConfig());
-  wsSend({ type: 'start' });
-  state.streamStartWall = Date.now();
+  resetResend();
+  startRun();
   $('startBtn').textContent = '停止';
   $('startBtn').classList.add('running');
   if (src !== 'system') listMics();
@@ -1143,6 +1320,7 @@ bind('clKey', 'tr.claude.apiKey');
 bind('clModel', 'tr.claude.model');
 bind('clEffort', 'tr.claude.effort');
 bind('trContext', 'tr.contextSize');
+bind('trDomain', 'tr.domain');
 bind('locBase', 'tr.local.baseUrl');
 bind('locModel', 'tr.local.model');
 updateProviderFields();
@@ -1184,11 +1362,79 @@ bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => {
 });
 if (settings.tr.useLocal) warmupLocal();
 
-bind('asrLang', 'asr.language', sendConfig);
+// Recognition language: four fixed choices, or "其他…" plus one language from Whisper's list.
+const ASR_LANG_MAIN = ['any', 'it', 'en', 'it_en'];
+const langName = (() => {
+  let names = null;
+  try {
+    names = new Intl.DisplayNames(['zh-CN'], { type: 'language' });
+  } catch {
+    /* old browser: codes only */
+  }
+  return (code) => {
+    const n = names?.of(code);
+    return n && n !== code ? `${n} (${code})` : code;
+  };
+})();
+
+function addOtherLangOption(code) {
+  const sel = $('asrLangOther');
+  if ([...sel.options].some((o) => o.value === code)) return;
+  sel.append(new Option(langName(code), code));
+}
+
+function showAsrLang() {
+  const v = settings.asr.language;
+  const main = ASR_LANG_MAIN.includes(v) ? v : 'other';
+  $('asrLang').value = main;
+  $('asrLangOtherField').classList.toggle('hidden', main !== 'other');
+  if (main === 'other') {
+    addOtherLangOption(v); // shown even before the list has loaded
+    $('asrLangOther').value = v;
+  }
+}
+
+function setAsrLang(v) {
+  settings.asr.language = v;
+  if (!ASR_LANG_MAIN.includes(v)) settings.asr.lastOther = v; // offered again next time "其他…" is picked
+  saveSettings();
+  showAsrLang();
+  sendConfig();
+}
+
+// The list comes from the backend (Whisper's languages); Italian and English have their own entries.
+async function loadOtherLangs() {
+  const sel = $('asrLangOther');
+  if (sel.dataset.loaded) return;
+  try {
+    const { languages } = await (await fetch('/api/languages')).json();
+    const keep = settings.asr.language;
+    sel.textContent = '';
+    languages
+      .filter((c) => c !== 'it' && c !== 'en')
+      .map((c) => [langName(c), c])
+      .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
+      .forEach(([name, c]) => sel.append(new Option(name, c)));
+    sel.dataset.loaded = '1';
+    if (!ASR_LANG_MAIN.includes(keep)) addOtherLangOption(keep);
+    showAsrLang();
+  } catch {
+    /* backend not up yet: retried when the WebSocket connects */
+  }
+}
+
+$('asrLang').addEventListener('change', () => {
+  const v = $('asrLang').value;
+  setAsrLang(v === 'other' ? settings.asr.lastOther || 'fr' : v);
+});
+$('asrLangOther').addEventListener('change', () => setAsrLang($('asrLangOther').value));
+showAsrLang();
+loadOtherLangs();
 bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);
 bind('asrGlossary', 'asr.glossaryPrompt', sendConfig);
+bind('asrHint', 'asr.hint', sendConfig);
 bind('asrPartial', 'asr.partial', sendConfig);
 
 const showGain = () => {

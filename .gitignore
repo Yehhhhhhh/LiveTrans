@@ -19,3 +19,6 @@ Thumbs.db
 
 # Debug audio recordings (LIVETRANS_RECORD=1)
 recordings/
+
+# Tests
+.pytest_cache/
