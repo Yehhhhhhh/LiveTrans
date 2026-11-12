@@ -113,6 +113,7 @@ class Segmenter:
         self.in_speech = False
         self.seg_frames: list[np.ndarray] = []
         self.seg_probs: list[float] = []  # speech probability of each frame in seg_frames
+        self.seg_carried = False  # the segment in progress began with audio left by a hard cut
         self.seg_start_frame = 0
         self.speech_frames = 0
         self.silence_frames = 0
@@ -183,6 +184,7 @@ class Segmenter:
                 self.index += 1
                 self.seg_frames = list(self.preroll)
                 self.seg_probs = list(self.preroll_probs)
+                self.seg_carried = False
                 self.seg_start_frame = self.frames_seen - len(self.seg_frames)
                 self.preroll.clear()
                 self.preroll_probs.clear()
@@ -216,6 +218,7 @@ class Segmenter:
             seg = self._emit()
             self.index += 1
             self.seg_frames, self.seg_probs = rest_frames, rest_probs
+            self.seg_carried = bool(rest_frames)
             self.seg_start_frame = self.frames_seen - len(rest_frames)
             self.speech_frames, self.silence_frames = self._count(rest_probs)
             return seg
@@ -227,18 +230,23 @@ class Segmenter:
         The frame where speech was least likely (averaged with its two neighbours, so one odd
         frame doesn't decide) among the last hard_cut_lookback_ms, but never in the first half of
         the segment. Of equally unlikely places the frame that is itself least likely wins, then
-        the latest, so steady speech is cut at the limit as before. The chosen frame opens the
-        next segment."""
+        the latest. The chosen frame opens the next segment. When no place is less likely than
+        the limit itself (steady speech), the whole segment is emitted, as before."""
         probs = self.seg_probs
         n = len(probs)
         look = min(round(self.params.hard_cut_lookback_ms / FRAME_MS), n // 2)
-        best, k = (float("inf"), float("inf")), n
-        for i in range(n - look, n):
+
+        def score(i: int) -> tuple[float, float]:
             window = probs[max(0, i - 1) : i + 2]
             # Rounded: the same three values summed in another order must compare equal.
-            score = (round(sum(window) / len(window), 6), probs[i])
-            if score <= best:
-                best, k = score, i
+            return round(sum(window) / len(window), 6), probs[i]
+
+        limit = score(n - 1)
+        best, k = limit, n
+        for i in range(n - look, n - 1):
+            s = score(i)
+            if s < limit and s <= best:
+                best, k = s, i
         return k
 
     def _count(self, probs: list[float]) -> tuple[int, int]:
@@ -279,7 +287,11 @@ class Segmenter:
         start = self.seg_start_frame * FRAME / SR
         self.seg_frames = []
         self.seg_probs = []
-        if self.speech_frames * FRAME_MS < p.min_speech_ms or not frames:
+        # Too little speech is dropped as noise, except what a hard cut left over: that is the
+        # end of a sentence already under way, however short.
+        too_short = self.speech_frames * FRAME_MS < p.min_speech_ms and not (self.seg_carried and self.speech_frames)
+        self.seg_carried = False
+        if too_short or not frames:
             self.dropped.append(self.index)
             return None
         return Segment(start=start, audio=np.concatenate(frames), index=self.index)

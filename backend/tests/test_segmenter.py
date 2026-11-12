@@ -53,15 +53,42 @@ def test_no_audio_is_lost_or_repeated_across_hard_cuts():
 def test_steady_speech_is_still_cut_at_the_limit():
     seg, out = run([0.9] * 200)
     assert len(out) == 1
-    # Nothing to choose between the frames: only the newest one moves to the next segment.
-    assert len(frame_numbers(out[0].audio)) == MAX_FRAMES - 1
+    # Nothing to choose between the frames: the whole segment goes out, none is carried over.
+    assert frame_numbers(out[0].audio) == list(range(MAX_FRAMES))
+    assert frame_numbers(seg.current_audio()) == list(range(MAX_FRAMES, 200))
+
+
+def test_stopping_right_after_a_hard_cut_loses_nothing():
+    # Steady speech: stop on the very frame of the cut.
+    seg, out = run([0.9] * MAX_FRAMES)
+    out += seg.flush()
+    assert [n for s in out for n in frame_numbers(s.audio)] == list(range(MAX_FRAMES))
+
+    # A gap 3 frames before the limit: the 3 carried frames are far less than min_speech_ms,
+    # but they are the end of the sentence, not a noise burst.
+    probs = [0.9] * MAX_FRAMES
+    probs[MAX_FRAMES - 4] = 0.4
+    seg, out = run(probs)
+    out += seg.flush()
+    assert len(out) == 2
+    assert [n for s in out for n in frame_numbers(s.audio)] == list(range(MAX_FRAMES))
+    assert not seg.take_dropped()
+
+
+def test_a_short_burst_is_still_dropped_after_an_earlier_hard_cut():
+    probs = [0.9] * 200 + [0.0] * 60 + [0.9] * 5 + [0.0] * 60
+    seg, out = run(probs)
+    # The long speech (cut once), then the 5-frame burst on its own: dropped as before.
+    assert len(out) == 2
+    assert frame_numbers(out[-1].audio)[-1] < 262
+    assert len(seg.take_dropped()) == 1
 
 
 def test_a_dip_older_than_the_lookback_or_in_the_first_half_is_ignored():
     probs = [0.9] * 200
     probs[30] = 0.4  # 3 s before the limit: outside the 2 s lookback
     seg, out = run(probs)
-    assert len(frame_numbers(out[0].audio)) == MAX_FRAMES - 1
+    assert len(frame_numbers(out[0].audio)) == MAX_FRAMES
 
     lookback = round(SegmenterParams().hard_cut_lookback_ms / FRAME_MS)
     assert MAX_FRAMES - lookback < 70  # 70 is inside the lookback
