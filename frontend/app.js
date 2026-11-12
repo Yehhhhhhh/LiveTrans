@@ -419,6 +419,10 @@ function onStatus(msg) {
   showAsrModels(msg);
 }
 
+const MODEL_LABELS = {
+  'large-v3-turbo': 'large-v3-turbo（快）',
+  'large-v3': 'large-v3（更准，更慢，更占显存）',
+};
 const COMPUTE_LABELS = {
   auto: '自动（GPU 用 float16，CPU 用 int8）',
   float16: 'float16（标准）',
@@ -440,9 +444,13 @@ function showAsrModels(msg) {
     }
     $(id).value = settings.asr[key];
   };
-  fill('asrModel', 'model', msg.models, msg.default_model, (m) => m);
-  fill('asrCompute', 'compute', msg.compute_types, msg.default_compute, (c) => COMPUTE_LABELS[c] || c, (c) => (c === 'auto' ? '自动：GPU 用 float16，CPU 用 int8' : c));
-  showAsrVram();
+  fill('asrModel', 'model', msg.models, msg.default_model, (m) => MODEL_LABELS[m] || m, (m) => m);
+  fill(
+    'asrCompute', 'compute', msg.compute_types, msg.default_compute,
+    (c) => COMPUTE_LABELS[c] || c,
+    (c) => (c === 'auto' ? '自动：GPU 用 float16，CPU 用 int8' : c),
+  );
+  refreshVram(); // a model was just loaded or is loading: the GPU's memory changed
 }
 
 // Rough VRAM need of a model: its weights (parameter count x bytes per weight) plus about
@@ -451,37 +459,61 @@ const MODEL_PARAMS_M = { 'large-v3-turbo': 809, 'large-v3': 1550 };
 const WEIGHT_BYTES = { float16: 2, int8_float16: 1, int8: 1, float32: 4 };
 
 function estimateVramGb(model, compute, onCpu) {
-  const bytes = WEIGHT_BYTES[compute === 'auto' ? (onCpu ? 'int8' : 'float16') : compute];
+  if (onCpu) return 0;
+  const bytes = WEIGHT_BYTES[compute === 'auto' ? 'float16' : compute];
   if (!MODEL_PARAMS_M[model] || !bytes) return null;
   return (MODEL_PARAMS_M[model] * bytes) / 1024 + 1.5;
 }
 
-// The line under the model choices: what the chosen combination needs, and how full the GPU is.
-async function showAsrVram() {
+// "6.6/8GB": memory in use on the whole GPU (every program), as nvidia-smi reports it.
+function vramText(gpu) {
+  return `${(gpu.used_mb / 1024).toFixed(1)}/${Math.round(gpu.total_mb / 1024)}GB`;
+}
+
+// The line under the model choices, and the pill at the end of the status bar.
+function showVram() {
   const st = state.asrStatus;
-  if (!st) return;
-  const model = settings.asr.model || st.default_model;
-  const compute = settings.asr.compute || st.default_compute;
-  const onCpu = st.model === 'ready' && st.device === 'cpu';
-  const est = estimateVramGb(model, compute, onCpu);
-  const parts = [];
-  if (onCpu) parts.push('当前在 CPU 上运行，不占显存。');
-  else if (est) parts.push(`所选组合预计占用显存约 ${est.toFixed(1)} GB（估计值，实际以加载后为准）。`);
-  else parts.push('这个组合没有显存占用的估计值。');
+  const gpu = state.gpu;
+  const hasGpu = Boolean(gpu && gpu.total_mb);
+  if (st) {
+    const model = settings.asr.model || st.default_model;
+    const compute = settings.asr.compute || st.default_compute;
+    const est = estimateVramGb(model, compute, st.model === 'ready' && st.device === 'cpu');
+    let text = `预计显存占用：${est === null ? '未知' : `${est.toFixed(1)}GB`}`;
+    if (hasGpu) text += `，目前显存占用：${vramText(gpu)}`;
+    $('asrVram').textContent = `${text}。`;
+  }
+  const pill = $('stVram');
+  if (!hasGpu) {
+    pill.classList.add('hidden');
+    return;
+  }
+  const used = gpu.used_mb / gpu.total_mb;
+  setPill(pill, `显存占用：${vramText(gpu)}`, used >= VRAM_ERR ? 'err' : used >= VRAM_WARN ? 'warn' : '');
+}
+
+// Share of the GPU's memory in use from which the pill turns yellow, then red. Near full,
+// Whisper slows down sharply (Windows starts paging VRAM to system RAM) or fails to load.
+const VRAM_WARN = 0.8;
+const VRAM_ERR = 0.9;
+const VRAM_POLL_MS = 5000;
+
+async function refreshVram() {
   const seq = (state.vramSeq = (state.vramSeq || 0) + 1);
-  let gpu = {};
+  let gpu = null;
   try {
     gpu = await (await fetch('/api/gpu')).json();
   } catch {
-    /* backend not reachable: show the estimate alone */
+    /* backend not reachable: no reading */
   }
   if (seq !== state.vramSeq) return; // a newer call is on its way
-  if (gpu.total_mb) {
-    const gb = (mb) => (mb / 1024).toFixed(1);
-    parts.push(`显卡显存现在已用 ${gb(gpu.used_mb)} / 共 ${gb(gpu.total_mb)} GB（包括其他程序）。`);
-  }
-  $('asrVram').textContent = parts.join('');
+  state.gpu = gpu;
+  showVram();
 }
+
+setInterval(() => {
+  if (!document.hidden) refreshVram();
+}, VRAM_POLL_MS);
 
 // ---------------------------------------------------------------- segments
 
@@ -1503,7 +1535,7 @@ showAsrLang();
 loadOtherLangs();
 const onModelChoice = () => {
   sendConfig();
-  showAsrVram();
+  showVram();
 };
 bind('asrModel', 'asr.model', onModelChoice);
 bind('asrCompute', 'asr.compute', onModelChoice);

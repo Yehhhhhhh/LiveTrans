@@ -73,6 +73,7 @@
     <span id="shareLabel" class="pill share-label hidden"></span>
     <span id="stAsr" class="pill">识别：-</span>
     <span id="stTr" class="pill">翻译：-</span>
+    <span id="stVram" class="pill hidden"></span>
   </footer>
 
   <!-- 设置面板 -->
@@ -174,8 +175,7 @@
         <label class="field">计算精度
           <select id="asrCompute"><option value="">默认</option></select>
         </label>
-        <p class="hint">large-v3 比 large-v3-turbo 更准，但更慢、更占显存，首次选择需下载约 3GB；字幕明显滞后时请换回 turbo。int8 精度的权重只占一半显存，准确度略降。</p>
-        <p class="hint" id="asrVram"></p>
+        <div class="row" id="asrVram"></div>
       </div>
 
       <div class="sect">
