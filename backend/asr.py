@@ -157,6 +157,54 @@ def clean_text(text: str, prompt: str = "") -> str:
     return text
 
 
+# faster-whisper keeps only the last 223 tokens of a prompt (half of Whisper's 448-token window,
+# see WhisperModel.get_prompt) and silently drops what comes before; stay a little under that.
+PROMPT_TOKENS = 215
+
+
+def fit_prompt(count, prompt: str, context: str = "") -> str:
+    """The Whisper prompt for one segment: `prompt` (see split_prompt) followed by `context`, the
+    text recognized just before, cut down to PROMPT_TOKENS so that nothing is dropped silently.
+
+    The previous sentence goes last because Whisper reads its prompt as the transcript so far:
+    it continues in that spelling, casing and vocabulary. What gives way when it doesn't all fit:
+    first the glossary terms from the end (app.js lists the newest terms first), then the start
+    of the context. The course hint always stays. `count` returns the number of tokens of a text.
+    """
+    context = context.strip()
+    if not prompt and not context:
+        return ""
+    hint, sep, rest = prompt.partition(". ")
+    if not sep:
+        hint, rest = "", prompt
+    head = f"{hint.strip()}. " if hint.strip() else ""
+    terms = [t.strip() for t in rest.strip().rstrip(".").split(", ") if t.strip()]
+
+    budget = PROMPT_TOKENS - (count(head) if head else 0)
+    words = context.split()
+    while words and count(" ".join(words)) > budget:
+        words = words[max(1, len(words) // 8):]
+    context = " ".join(words)
+    budget -= count(context) if context else 0
+
+    kept = []
+    for term in terms:
+        budget -= count(term + ",")
+        if budget < 0:
+            break
+        kept.append(term)
+    text = head + (", ".join(kept) + "." if kept else "")
+    return f"{text.rstrip()} {context}".strip() if context else text
+
+
+def echoes_context(text: str, context: str) -> bool:
+    """Whether `text` is just the end of `context` again. On noise or a breath Whisper sometimes
+    recites the end of its prompt instead of transcribing; a real sentence repeated word for word
+    is much rarer, and short ones ("Va bene.") are left alone."""
+    words = _WORD.findall(text.lower())
+    return len(words) >= 4 and _WORD.findall(context.lower())[-len(words):] == words
+
+
 def setup_cuda_dlls() -> None:
     """Make the pip-installed CUDA/cuDNN DLLs (nvidia-*-cu12) loadable on Windows."""
     if os.name != "nt":
@@ -226,8 +274,13 @@ class Transcriber:
         total = sum(scores.values()) or 1.0
         return lang, scores.get(lang, 0.0) / total
 
+    def count_tokens(self, text: str) -> int:
+        # As faster-whisper encodes a prompt: a leading space, no special tokens.
+        return len(self.model.hf_tokenizer.encode(" " + text.strip(), add_special_tokens=False).ids)
+
     def transcribe_partial(self, audio: np.ndarray, lang: str, prompt: str = "") -> str:
         """Fast greedy pass over a segment still being spoken; the final pass redoes it properly."""
+        initial_prompt = fit_prompt(self.count_tokens, prompt) if prompt else ""
         segments, _ = self.model.transcribe(
             audio,
             language=lang,
@@ -236,19 +289,32 @@ class Transcriber:
             vad_filter=False,
             condition_on_previous_text=False,
             without_timestamps=True,
-            initial_prompt=prompt or None,
+            initial_prompt=initial_prompt or None,
         )
         text = clean_text(" ".join(s.text.strip() for s in segments if s.text.strip()), prompt)
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
         return re.sub(r"[.…]+$", "", text).strip()
 
-    def transcribe(self, audio: np.ndarray, language: str = IT_EN, prompt: str = "") -> dict:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        language: str = IT_EN,
+        prompt: str = "",
+        context: str = "",
+        context_lang: str = "",
+    ) -> dict:
+        """`context` is the text recognized just before this audio, in `context_lang`. It is given
+        to Whisper as the transcript so far (see fit_prompt), but only when this audio is in the
+        same language: text in another language pulls the decoding toward that language."""
         t0 = time.time()
         mode = normalize_language(language) or IT_EN
         if is_fixed(mode):
             lang, lang_prob = mode, 1.0
         else:
             lang, lang_prob = self.pick_language(audio, detect_among(mode))
+        if context_lang != lang:
+            context = ""
+        initial_prompt = fit_prompt(self.count_tokens, prompt, context) if prompt or context else ""
         segments, _ = self.model.transcribe(
             audio,
             language=lang,
@@ -256,7 +322,7 @@ class Transcriber:
             vad_filter=False,
             condition_on_previous_text=False,
             without_timestamps=True,
-            initial_prompt=prompt or None,
+            initial_prompt=initial_prompt or None,
             no_speech_threshold=0.6,
             log_prob_threshold=-1.0,
             compression_ratio_threshold=2.4,
@@ -272,9 +338,12 @@ class Transcriber:
             text = clean_text(s.text, prompt)
             if text:
                 parts.append(text)
+        text = clean_text(" ".join(parts), prompt)
+        if context and echoes_context(text, context):
+            text = ""
         return {
             "lang": lang,
             "lang_prob": round(lang_prob, 3),
-            "text": clean_text(" ".join(parts), prompt),
+            "text": text,
             "asr_ms": int((time.time() - t0) * 1000),
         }

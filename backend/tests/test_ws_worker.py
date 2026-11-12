@@ -51,7 +51,7 @@ class FakeTranscriber:
         self.compute_type = "int8"
         self.calls = 0
 
-    def transcribe(self, audio, language="auto", prompt=""):
+    def transcribe(self, audio, language="auto", prompt="", context="", context_lang=""):
         self.calls += 1
         return {"lang": "it", "lang_prob": 1.0, "text": f"testo {self.calls}", "asr_ms": 1}
 

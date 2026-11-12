@@ -98,7 +98,7 @@ class FakeTranscriber:
         self.device = "cpu"
         self.compute_type = "int8"
 
-    def transcribe(self, audio, language="auto", prompt=""):
+    def transcribe(self, audio, language="auto", prompt="", context="", context_lang=""):
         return {"lang": "it", "lang_prob": 1.0, "text": "testo", "asr_ms": 1}
 
 
@@ -243,7 +243,7 @@ class FlakyTranscriber(FakeTranscriber):
         self.failures = failures
         self.calls = 0
 
-    def transcribe(self, audio, language="auto", prompt=""):
+    def transcribe(self, audio, language="auto", prompt="", context="", context_lang=""):
         self.calls += 1
         if self.calls <= self.failures:
             raise RuntimeError("CUDA error: transient")
