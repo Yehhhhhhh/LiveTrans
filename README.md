@@ -24,13 +24,15 @@
 
 ## 安装与启动
 
-1. 双击 `install.bat`：创建 `.venv` 并安装依赖（含 CUDA/cuDNN 运行库，不需要单独装 CUDA，只需 NVIDIA 显卡驱动）。
+1. 双击 `install.bat`：创建 `.venv` 并安装依赖（含 CUDA/cuDNN 运行库，不需要单独装 CUDA，只需 NVIDIA 显卡驱动）。安装的是 `backend/requirements.lock` 中锁定的、测试过的版本，过一段时间重新安装也不会装到不兼容的新版本；锁定版本装不上时（例如 Python 版本不同）会自动改用 `requirements.txt` 中的版本范围。
 2. 双击 `start.bat`：启动后端，等后端就绪后自动打开 http://127.0.0.1:8765 。
    首次启动会下载 Whisper `large-v3-turbo` 模型（约 1.6GB），状态栏显示「模型：large-v3-turbo · cuda/float16」即就绪。
    下载困难时，编辑 `start.bat`，取消 `HF_ENDPOINT` 那行的注释使用镜像。
 3. 在「设置 → 翻译」中填写 API，或开启「本地模型」（见下文），点「测试翻译」确认可用。
 
-更新代码后（`git pull`）需要关掉 `start.bat` 窗口重新启动，后端的改动才会生效；只改了页面的话刷新浏览器即可。
+更新代码后（`git pull`）需要关掉 `start.bat` 窗口重新启动，后端的改动才会生效；只改了页面的话刷新浏览器即可。如果 `backend/requirements.lock` 有变化，先重新运行一次 `install.bat`。
+
+升级依赖：在 `.venv` 中升级并测试通过后，运行 `.venv\Scripts\python backend\tools\freeze_lock.py` 重新生成 `requirements.lock`（只包含 `requirements.txt` 及其依赖，不含 pytest 等开发工具）。
 
 ## 音源
 
@@ -161,7 +163,9 @@
 ## 结构
 
 ```
-backend/requirements.txt  Python 依赖
+backend/requirements.txt  Python 依赖（版本范围）
+backend/requirements.lock 测试过的精确版本，install.bat 用它安装
+backend/tools/         freeze_lock.py：由当前环境生成 requirements.lock
 backend/server.py      FastAPI：/ws 音频流、/api/translate 翻译代理、/api/window 窗口信息、静态页面
 backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（识别语言模式）、幻觉过滤
