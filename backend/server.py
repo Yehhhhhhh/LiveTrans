@@ -240,11 +240,14 @@ CONTEXT_MAX_GAP_S = 15.0
 
 
 def context_tail(text: str) -> str:
-    """The last CONTEXT_CHARS characters of the text, starting at a word."""
+    """The last CONTEXT_CHARS characters of the text, starting at a word where there is one."""
     text = " ".join(text.split())
     if len(text) <= CONTEXT_CHARS:
         return text
-    return text[-CONTEXT_CHARS:].partition(" ")[2]
+    tail = text[-CONTEXT_CHARS:]
+    cut = tail.find(" ", 0, 40)
+    # No space near the start (Chinese, Japanese… are written without): keep the tail as it is.
+    return tail[cut + 1 :] if cut >= 0 else tail
 
 
 def merge_segments(items: list[Segment]) -> Segment:

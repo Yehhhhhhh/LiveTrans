@@ -58,6 +58,21 @@ def test_echo_of_the_context_is_spotted():
     assert not echoes_context("Il segnale viene trasmesso sul canale.", "")
 
 
+def test_text_without_spaces_is_handled_by_characters():
+    zh = "今天我们继续讲信道容量和香农定理的证明过程"
+    # Trimming: one character per token here, so a long context loses its start, not everything.
+    out = fit_prompt(len, "课程. ", zh * 20)
+    assert out.startswith("课程.") and out.endswith("证明过程")
+    assert len(out) <= PROMPT_TOKENS + 1
+    # Echo: the whole clause is a single "word".
+    assert echoes_context("香农定理的证明过程。", zh)
+    assert not echoes_context("证明过程", zh)  # short
+    assert not echoes_context("香农定理的推导过程。", zh)
+    # The tail kept between segments is not emptied.
+    tail = server.context_tail(zh * 20)
+    assert len(tail) == server.CONTEXT_CHARS and tail.endswith("证明过程")
+
+
 class FakeModel:
     def __init__(self, text=" il pacchetto arriva al router di destinazione"):
         self.text = text

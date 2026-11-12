@@ -181,10 +181,12 @@ def fit_prompt(count, prompt: str, context: str = "") -> str:
     terms = [t.strip() for t in rest.strip().rstrip(".").split(", ") if t.strip()]
 
     budget = PROMPT_TOKENS - (count(head) if head else 0)
-    words = context.split()
-    while words and count(" ".join(words)) > budget:
-        words = words[max(1, len(words) // 8):]
-    context = " ".join(words)
+    while context and count(context) > budget:
+        words = context.split()
+        if len(words) > 1:
+            context = " ".join(words[max(1, len(words) // 8):])
+        else:  # Chinese, Japanese…: no spaces to cut at
+            context = context[max(1, len(context) // 8):]
     budget -= count(context) if context else 0
 
     kept = []
@@ -202,7 +204,14 @@ def echoes_context(text: str, context: str) -> bool:
     recites the end of its prompt instead of transcribing; a real sentence repeated word for word
     is much rarer, and short ones ("Va bene.") are left alone."""
     words = _WORD.findall(text.lower())
-    return len(words) >= 4 and _WORD.findall(context.lower())[-len(words):] == words
+    before = _WORD.findall(context.lower())
+    if len(words) >= 4:
+        return before[-len(words):] == words
+    # Chinese, Japanese…: written without spaces, a whole clause is one "word" here, so
+    # compare the characters instead.
+    flat = "".join(words)
+    unspaced = any(ord(c) >= 0x2E80 for c in flat)
+    return unspaced and len(flat) >= 8 and "".join(before).endswith(flat)
 
 
 def setup_cuda_dlls() -> None:
