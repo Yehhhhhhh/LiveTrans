@@ -64,7 +64,9 @@ def build_user_message(text: str, context: list[dict], glossary: list[dict]) -> 
         lines = []
         for c in context:
             lines.append(f"原文：{c.get('src', '')}")
-            lines.append(f"译文：{c.get('tgt', '')}")
+            # Earlier segments still being translated (translations run in parallel) come without one.
+            if c.get("tgt"):
+                lines.append(f"译文：{c['tgt']}")
         parts.append("上文（仅供参考）：\n" + "\n".join(lines))
     parts.append("请翻译这一段：\n" + text)
     return "\n\n".join(parts)

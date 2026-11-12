@@ -86,7 +86,7 @@ const state = {
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
-  trBusy: false,
+  trActive: 0, // final translations in flight
   wakeLock: null,
 };
 
@@ -489,15 +489,26 @@ function enqueueTranslation(seg) {
   pumpTranslations();
 }
 
-async function pumpTranslations() {
-  if (state.trBusy) return;
-  state.trBusy = true;
-  while (state.trQueue.length) {
+// Final translations run several at a time, so one slow reply doesn't hold up every line after
+// it. Each line fills in as soon as its own translation is done; a request that starts while
+// earlier lines are still being translated gets their source text as context (see contextFor).
+// The local model runs one at a time: it shares the GPU with Whisper, and Ollama would queue
+// parallel requests anyway unless configured otherwise.
+const TR_PARALLEL_API = 2;
+const trParallel = () => (settings.tr.useLocal ? 1 : TR_PARALLEL_API);
+const trBusy = () => state.trActive > 0 || state.trQueue.length > 0;
+
+function pumpTranslations() {
+  while (state.trQueue.length && state.trActive < trParallel()) {
     const seg = state.trQueue.shift();
-    await translateSeg(seg);
+    state.trActive++;
+    translateSeg(seg).finally(() => {
+      state.trActive--;
+      pumpTranslations();
+    });
   }
-  state.trBusy = false;
-  pumpLive();
+  // Live drafts only run while no final translation is waiting.
+  if (!trBusy()) pumpLive();
 }
 
 function translationRequest(text, context) {
@@ -542,17 +553,18 @@ async function postTranslate(body, onText = () => {}, signal = undefined) {
   }
 }
 
-// Context: the previous translated segments of the same session (all of the
-// current session's when seg is null, i.e. for the segment still being spoken).
+// Context: the previous segments of the same session (all of the current session's when seg is
+// null, i.e. for the segment still being spoken). Translated ones come with their translation;
+// ones still being translated (translations run in parallel) with their source text only.
 async function contextFor(seg) {
   const list = !seg || seg.sessionId === state.session?.id ? state.segments : await db.getSegments(seg.sessionId);
   const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
   const n = Number(settings.tr.contextSize) || 0;
   return list
     .slice(0, idx < 0 ? list.length : idx)
-    .filter((s) => s.trStatus === 'done')
+    .filter((s) => s.trStatus === 'done' || s.trStatus === 'pending' || s.trStatus === 'streaming')
     .slice(-n)
-    .map((s) => ({ src: s.text, tgt: s.translation }));
+    .map((s) => ({ src: s.text, tgt: s.trStatus === 'done' ? s.translation : '' }));
 }
 
 async function translateSeg(seg) {
@@ -633,7 +645,7 @@ function showLive() {
 
 function pumpLive() {
   // Final translations go first; this runs again when their queue drains.
-  if (live.req || state.trBusy) return;
+  if (live.req || trBusy()) return;
   const pos = live.sentences.findIndex((s) => s && !live.done.has(liveKey(s)) && !live.failed.has(liveKey(s)));
   if (pos < 0) return;
   const text = live.sentences[pos];
