@@ -84,6 +84,15 @@ clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
 
+def download_progress() -> dict | None:
+    """The model download in progress, for the page's progress bar; None when there is none."""
+    progress = getattr(transcriber, "progress", None)
+    if not progress or transcriber.status != "loading":
+        return None
+    done, total, rate = progress
+    return {"done": done, "total": total, "rate": round(rate) if rate else None}
+
+
 def status_message() -> dict:
     return {
         "type": "status",
@@ -93,6 +102,7 @@ def status_message() -> dict:
         "default_model": MODEL,
         "compute_types": list(COMPUTE_TYPES),
         "default_compute": COMPUTE_TYPE,
+        "download": download_progress(),
         "device": transcriber.device,
         "compute_type": transcriber.compute_type,
         "error": transcriber.error,
@@ -192,6 +202,8 @@ def gpu_memory() -> tuple[int, int] | None:
 async def lifespan(_: FastAPI):
     global translator, vad_model, loop
     loop = asyncio.get_running_loop()
+    # Called from the thread that loads the model, as its download advances.
+    transcriber.on_progress = lambda: asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
     vad_model = SileroModel()
     translator = Translator()
     load_model_in_background()

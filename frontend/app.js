@@ -413,7 +413,11 @@ function startRun() {
 function onStatus(msg) {
   const el = $('stModel');
   if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
-  else if (msg.model === 'loading') setPill(el, '模型：加载中（首次需下载）…', 'warn');
+  else if (msg.model === 'loading') {
+    const dl = msg.download;
+    setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
+  }
+  showDownload(msg);
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
   if (msg.error) showMsg(msg.error);
   showAsrModels(msg);
@@ -430,10 +434,35 @@ const COMPUTE_LABELS = {
   int8: 'int8（省显存，准确度略降）',
 };
 
+// Progress of a model download, shown where the messages are (below one that is showing).
+function showDownload(msg) {
+  const dl = msg.model === 'loading' ? msg.download : null;
+  const box = $('dlToast');
+  box.classList.toggle('hidden', !dl);
+  if (!dl) return;
+  const gb = (b) => (b / 1024 ** 3).toFixed(1);
+  const speed = dl.rate ? `，${(dl.rate / 1024 ** 2).toFixed(1)}MB/s` : '';
+  $('dlText').textContent = `正在下载模型 ${msg.model_name}：${gb(dl.done)}/${gb(dl.total)}GB${speed}`;
+  $('dlBar').value = dl.total ? dl.done / dl.total : 0;
+  const top = document.querySelector('.topbar').getBoundingClientRect().bottom + 8;
+  const toast = $('toast');
+  box.style.top = `${toast.classList.contains('hidden') ? top : toast.getBoundingClientRect().bottom + 8}px`;
+}
+
 // 设置 → 识别 → 模型: the choices come from the backend, which loads nothing else.
 function showAsrModels(msg) {
   if (!Array.isArray(msg.models) || !Array.isArray(msg.compute_types)) return;
+  const before = state.asrStatus;
   state.asrStatus = msg;
+  // Status messages also arrive twice a second during a download: leave the choices alone
+  // (one may be open) unless the lists changed, and only re-read the GPU when the model did.
+  const lists = (m) => JSON.stringify([m.models, m.default_model, m.compute_types, m.default_compute]);
+  const loaded = (m) => JSON.stringify([m.model, m.model_name, m.compute_type, m.device]);
+  if (before && lists(before) === lists(msg)) {
+    if (loaded(before) !== loaded(msg)) refreshVram();
+    else showVram();
+    return;
+  }
   const fill = (id, key, all, def, label, defLabel = label) => {
     const others = all.filter((v) => v !== def);
     $(id).replaceChildren(new Option(`默认（${defLabel(def)}）`, ''), ...others.map((v) => new Option(label(v), v)));

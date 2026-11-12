@@ -6,6 +6,7 @@ import types
 
 import pytest
 
+import asr
 import server
 from asr import Transcriber
 from test_ws_worker import FakeSegmenter, FakeTranscriber, read_until, session
@@ -212,6 +213,7 @@ def fake_whisper(monkeypatch, failing, seen):
 
     tr = Transcriber()
     monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=WhisperModel))
+    monkeypatch.setattr(asr, "fetch_model", lambda name, report: name)  # nothing to download
     return tr
 
 
@@ -238,3 +240,75 @@ def test_load_without_fallback(monkeypatch):
     tr = fake_whisper(monkeypatch, set(), [])
     tr.load("large-v3-turbo", "cpu", "auto")
     assert (tr.status, tr.choice, tr.compute_type, tr.error) == ("ready", ("large-v3-turbo", "auto"), "int8", "")
+
+
+# ---------------------------------------------------------------- download progress
+
+
+def fake_hub(monkeypatch, steps):
+    """huggingface_hub.snapshot_download driving its bars the way the real one does: a files
+    bar, then a "received" and a "written" byte bar whose totals grow as each file is opened."""
+
+    def snapshot_download(repo, allow_patterns, tqdm_class):
+        assert repo == "Systran/faster-whisper-large-v3" and allow_patterns == asr.MODEL_FILES
+        received = tqdm_class(desc="Downloading bytes", total=0, initial=0, unit="B", unit_scale=True)
+        written = tqdm_class(desc="Reconstructing", total=0, initial=0, unit="B", unit_scale=True)
+        files = tqdm_class(desc="Fetching 5 files", total=5)
+        received.total = written.total = 1000
+        for kind, n in steps:
+            if kind == "received":
+                if received.n + n > received.total:  # the library stretches this bar's total
+                    received.total = int((received.n + n) * 1.25) + 1
+                received.update(n)
+            else:
+                written.update(n)
+        files.update(5)
+        return "/cache/large-v3"
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=snapshot_download))
+    monkeypatch.setitem(
+        sys.modules, "faster_whisper.utils", types.SimpleNamespace(_MODELS={"large-v3": "Systran/faster-whisper-large-v3"})
+    )
+    monkeypatch.setattr(asr, "PROGRESS_INTERVAL_S", 0)
+
+
+def test_fetch_model_reports_bytes_as_they_arrive(monkeypatch):
+    fake_hub(monkeypatch, [("received", 300), ("received", 300), ("written", 500), ("received", 600), ("written", 500)])
+    seen = []
+    path = asr.fetch_model("large-v3", lambda done, total, rate: seen.append((done, total)))
+    assert path == "/cache/large-v3"
+    # The bar that is ahead counts; the size stays the real one when "received" overshoots it.
+    assert seen == [(300, 1000), (600, 1000), (600, 1000), (1000, 1000), (1000, 1000)]
+
+
+def test_fetch_model_reports_nothing_for_a_cached_model(monkeypatch):
+    fake_hub(monkeypatch, [])
+    seen = []
+    asr.fetch_model("large-v3", lambda *a: seen.append(a))
+    assert seen == []
+
+
+def test_load_publishes_the_download_and_clears_it(monkeypatch):
+    seen = []
+    tr = fake_whisper(monkeypatch, set(), seen)
+
+    def fetch(name, report):
+        report(250, 1000, 2_000_000.0)
+        return "/cache/" + name
+
+    monkeypatch.setattr(asr, "fetch_model", fetch)
+    published = []
+    tr.on_progress = lambda: published.append(tr.progress)
+    tr.load("large-v3", "cuda", "auto")
+    assert published == [(250, 1000, 2_000_000.0), None]
+    assert seen[0][0] == "/cache/large-v3"  # loaded from the downloaded folder
+    assert (tr.status, tr.model_name, tr.choice) == ("ready", "large-v3", ("large-v3", "auto"))
+
+
+def test_status_carries_the_download_only_while_loading(fake):
+    fake.progress = (250, 1000, 2_000_000.4)
+    assert server.status_message()["download"] is None  # ready: a stale value is not shown
+    fake.status = "loading"
+    assert server.status_message()["download"] == {"done": 250, "total": 1000, "rate": 2_000_000}
+    fake.progress = None
+    assert server.status_message()["download"] is None
