@@ -12,6 +12,8 @@ const DEFAULTS = {
   asr: {
     language: 'it_en',
     lastOther: 'fr',
+    // Whisper model, one of those the backend offers; '' is its default (LIVETRANS_MODEL).
+    model: '',
     vadThreshold: 0.5,
     minSilenceMs: 600,
     maxSegmentS: 8,
@@ -237,6 +239,7 @@ function asrConfig() {
     type: 'config',
     asr: {
       language: settings.asr.language,
+      model: settings.asr.model,
       vad_threshold: Number(settings.asr.vadThreshold),
       min_silence_ms: Number(settings.asr.minSilenceMs),
       max_segment_s: Number(settings.asr.maxSegmentS),
@@ -410,6 +413,23 @@ function onStatus(msg) {
   else if (msg.model === 'loading') setPill(el, '模型：加载中（首次需下载）…', 'warn');
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
   if (msg.error) showMsg(msg.error);
+  showAsrModels(msg);
+}
+
+// 设置 → 识别 → 模型: the choices come from the backend, which loads nothing else.
+function showAsrModels(msg) {
+  if (!Array.isArray(msg.models)) return;
+  const others = msg.models.filter((m) => m !== msg.default_model);
+  $('asrModel').replaceChildren(
+    new Option(`默认（${msg.default_model}）`, ''),
+    ...others.map((m) => new Option(m, m)),
+  );
+  // A saved choice that is now the default, or no longer offered, becomes "默认".
+  if (settings.asr.model && !others.includes(settings.asr.model)) {
+    settings.asr.model = '';
+    saveSettings();
+  }
+  $('asrModel').value = settings.asr.model;
 }
 
 // ---------------------------------------------------------------- segments
@@ -1430,6 +1450,7 @@ $('asrLang').addEventListener('change', () => {
 $('asrLangOther').addEventListener('change', () => setAsrLang($('asrLangOther').value));
 showAsrLang();
 loadOtherLangs();
+bind('asrModel', 'asr.model', sendConfig);
 bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -41,6 +42,9 @@ PORT = int(os.environ.get("LIVETRANS_PORT", "8765"))
 MODEL = os.environ.get("LIVETRANS_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("LIVETRANS_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
+# Whisper models the page may choose in 设置 → 识别. Only these names are ever loaded: the name comes
+# from the page, and a free one could point faster-whisper at any repository or local path.
+ASR_MODELS = tuple(dict.fromkeys((MODEL, "large-v3-turbo", "large-v3")))
 # Set LIVETRANS_RECORD=1 to save each capture's raw 16 kHz audio to recordings/ (for tuning).
 RECORD = os.environ.get("LIVETRANS_RECORD", "") == "1"
 # Host names (besides localhost and IP addresses) the page may be opened under, comma-separated,
@@ -81,6 +85,8 @@ def status_message() -> dict:
         "type": "status",
         "model": transcriber.status,
         "model_name": transcriber.model_name or MODEL,
+        "models": list(ASR_MODELS),
+        "default_model": MODEL,
         "device": transcriber.device,
         "compute_type": transcriber.compute_type,
         "error": transcriber.error,
@@ -100,10 +106,66 @@ def load_model_in_background() -> None:
     def run() -> None:
         transcriber.load(MODEL, DEVICE, COMPUTE_TYPE)
         if loop:
-            asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
+            asyncio.run_coroutine_threadsafe(after_model_load(), loop)
 
     transcriber.status = "loading"
     threading.Thread(target=run, daemon=True).start()
+
+
+# The model the page asked for (设置 → 识别 → 模型). It can differ from the loaded one while a load
+# is running: the choice is kept and applied when that load ends (see ensure_model).
+wanted_model = [MODEL]
+switch_tasks: set[asyncio.Task] = set()
+
+
+def request_model(name: object) -> None:
+    """The page chose a model; "" is the server's default (LIVETRANS_MODEL)."""
+    if not isinstance(name, str):
+        return
+    name = name or MODEL
+    if name not in ASR_MODELS:
+        return
+    wanted_model[0] = name
+    ensure_model()
+
+
+def ensure_model() -> None:
+    """Start loading the wanted model unless it is the loaded one or a load is still running."""
+    if transcriber.status in ("idle", "loading") or wanted_model[0] == transcriber.model_name:
+        return
+    transcriber.status = "loading"  # from here on finals wait (wait_for_model) and partials stop
+    t = asyncio.create_task(switch_model(wanted_model[0]))
+    switch_tasks.add(t)
+    t.add_done_callback(switch_tasks.discard)
+
+
+def reload_model(name: str) -> None:
+    """Replace the loaded model with `name`; if that fails, go back to the one that was loaded."""
+    previous = transcriber.model_name if transcriber.model is not None else ""
+    # Free the old model first: two large models don't fit in the VRAM of an 8 GB card.
+    transcriber.model = None
+    gc.collect()
+    transcriber.load(name, DEVICE, COMPUTE_TYPE)
+    if transcriber.status == "error" and previous and previous != name:
+        error = transcriber.error
+        transcriber.load(previous, DEVICE, COMPUTE_TYPE)
+        if transcriber.status == "ready":
+            transcriber.error = f"{name} 加载失败，已换回 {previous}。{error}"
+
+
+async def switch_model(name: str) -> None:
+    await broadcast_status()
+    # Under gpu_lock: a transcription that is running finishes on the old model first.
+    async with gpu_lock:
+        await to_thread_to_end(reload_model, name)
+    if transcriber.model_name != name:
+        wanted_model[0] = transcriber.model_name  # failed: don't try the same model again
+    await after_model_load()
+
+
+async def after_model_load() -> None:
+    await broadcast_status()
+    ensure_model()  # the page may have chosen another model meanwhile
 
 
 @asynccontextmanager
@@ -522,6 +584,8 @@ async def ws_audio(ws: WebSocket) -> None:
                             live.update(lang_index=0, lang="")
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
+                    if "model" in asr:
+                        request_model(asr["model"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends

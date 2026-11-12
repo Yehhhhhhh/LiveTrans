@@ -167,6 +167,14 @@
       </div>
 
       <div class="sect">
+        <h3>模型</h3>
+        <label class="field">识别模型
+          <select id="asrModel"><option value="">默认</option></select>
+        </label>
+        <p class="hint">large-v3 比 large-v3-turbo 更准，但更慢、更占显存，首次选择需下载约 3GB；字幕明显滞后时请换回 turbo。</p>
+      </div>
+
+      <div class="sect">
         <h3>断句</h3>
         <label class="field">语音判定阈值 <input id="vadThr" type="number" step="0.05" min="0.1" max="0.95"></label>
         <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
