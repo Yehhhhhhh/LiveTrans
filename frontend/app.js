@@ -12,8 +12,10 @@ const DEFAULTS = {
   asr: {
     language: 'it_en',
     lastOther: 'fr',
-    // Whisper model, one of those the backend offers; '' is its default (LIVETRANS_MODEL).
+    // Whisper model and compute type (weight precision), from those the backend offers;
+    // '' is its default (LIVETRANS_MODEL, LIVETRANS_COMPUTE_TYPE).
     model: '',
+    compute: '',
     vadThreshold: 0.5,
     minSilenceMs: 600,
     maxSegmentS: 8,
@@ -240,6 +242,7 @@ function asrConfig() {
     asr: {
       language: settings.asr.language,
       model: settings.asr.model,
+      compute: settings.asr.compute,
       vad_threshold: Number(settings.asr.vadThreshold),
       min_silence_ms: Number(settings.asr.minSilenceMs),
       max_segment_s: Number(settings.asr.maxSegmentS),
@@ -416,20 +419,68 @@ function onStatus(msg) {
   showAsrModels(msg);
 }
 
+const COMPUTE_LABELS = {
+  auto: '自动（GPU 用 float16，CPU 用 int8）',
+  float16: 'float16（标准）',
+  int8_float16: 'int8_float16（省显存，准确度略降）',
+  int8: 'int8（省显存，准确度略降）',
+};
+
 // 设置 → 识别 → 模型: the choices come from the backend, which loads nothing else.
 function showAsrModels(msg) {
-  if (!Array.isArray(msg.models)) return;
-  const others = msg.models.filter((m) => m !== msg.default_model);
-  $('asrModel').replaceChildren(
-    new Option(`默认（${msg.default_model}）`, ''),
-    ...others.map((m) => new Option(m, m)),
-  );
-  // A saved choice that is now the default, or no longer offered, becomes "默认".
-  if (settings.asr.model && !others.includes(settings.asr.model)) {
-    settings.asr.model = '';
-    saveSettings();
+  if (!Array.isArray(msg.models) || !Array.isArray(msg.compute_types)) return;
+  state.asrStatus = msg;
+  const fill = (id, key, all, def, label, defLabel = label) => {
+    const others = all.filter((v) => v !== def);
+    $(id).replaceChildren(new Option(`默认（${defLabel(def)}）`, ''), ...others.map((v) => new Option(label(v), v)));
+    // A saved choice that is now the default, or no longer offered, becomes "默认".
+    if (settings.asr[key] && !others.includes(settings.asr[key])) {
+      settings.asr[key] = '';
+      saveSettings();
+    }
+    $(id).value = settings.asr[key];
+  };
+  fill('asrModel', 'model', msg.models, msg.default_model, (m) => m);
+  fill('asrCompute', 'compute', msg.compute_types, msg.default_compute, (c) => COMPUTE_LABELS[c] || c, (c) => (c === 'auto' ? '自动：GPU 用 float16，CPU 用 int8' : c));
+  showAsrVram();
+}
+
+// Rough VRAM need of a model: its weights (parameter count x bytes per weight) plus about
+// 1.5 GB for the CUDA libraries and the decoding work area. An estimate, not a measurement.
+const MODEL_PARAMS_M = { 'large-v3-turbo': 809, 'large-v3': 1550 };
+const WEIGHT_BYTES = { float16: 2, int8_float16: 1, int8: 1, float32: 4 };
+
+function estimateVramGb(model, compute, onCpu) {
+  const bytes = WEIGHT_BYTES[compute === 'auto' ? (onCpu ? 'int8' : 'float16') : compute];
+  if (!MODEL_PARAMS_M[model] || !bytes) return null;
+  return (MODEL_PARAMS_M[model] * bytes) / 1024 + 1.5;
+}
+
+// The line under the model choices: what the chosen combination needs, and how full the GPU is.
+async function showAsrVram() {
+  const st = state.asrStatus;
+  if (!st) return;
+  const model = settings.asr.model || st.default_model;
+  const compute = settings.asr.compute || st.default_compute;
+  const onCpu = st.model === 'ready' && st.device === 'cpu';
+  const est = estimateVramGb(model, compute, onCpu);
+  const parts = [];
+  if (onCpu) parts.push('当前在 CPU 上运行，不占显存。');
+  else if (est) parts.push(`所选组合预计占用显存约 ${est.toFixed(1)} GB（估计值，实际以加载后为准）。`);
+  else parts.push('这个组合没有显存占用的估计值。');
+  const seq = (state.vramSeq = (state.vramSeq || 0) + 1);
+  let gpu = {};
+  try {
+    gpu = await (await fetch('/api/gpu')).json();
+  } catch {
+    /* backend not reachable: show the estimate alone */
   }
-  $('asrModel').value = settings.asr.model;
+  if (seq !== state.vramSeq) return; // a newer call is on its way
+  if (gpu.total_mb) {
+    const gb = (mb) => (mb / 1024).toFixed(1);
+    parts.push(`显卡显存现在已用 ${gb(gpu.used_mb)} / 共 ${gb(gpu.total_mb)} GB（包括其他程序）。`);
+  }
+  $('asrVram').textContent = parts.join('');
 }
 
 // ---------------------------------------------------------------- segments
@@ -1450,7 +1501,12 @@ $('asrLang').addEventListener('change', () => {
 $('asrLangOther').addEventListener('change', () => setAsrLang($('asrLangOther').value));
 showAsrLang();
 loadOtherLangs();
-bind('asrModel', 'asr.model', sendConfig);
+const onModelChoice = () => {
+  sendConfig();
+  showAsrVram();
+};
+bind('asrModel', 'asr.model', onModelChoice);
+bind('asrCompute', 'asr.compute', onModelChoice);
 bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);

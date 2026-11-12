@@ -171,7 +171,11 @@
         <label class="field">识别模型
           <select id="asrModel"><option value="">默认</option></select>
         </label>
-        <p class="hint">large-v3 比 large-v3-turbo 更准，但更慢、更占显存，首次选择需下载约 3GB；字幕明显滞后时请换回 turbo。</p>
+        <label class="field">计算精度
+          <select id="asrCompute"><option value="">默认</option></select>
+        </label>
+        <p class="hint">large-v3 比 large-v3-turbo 更准，但更慢、更占显存，首次选择需下载约 3GB；字幕明显滞后时请换回 turbo。int8 精度的权重只占一半显存，准确度略降。</p>
+        <p class="hint" id="asrVram"></p>
       </div>
 
       <div class="sect">

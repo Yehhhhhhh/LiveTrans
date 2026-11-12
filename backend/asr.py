@@ -185,11 +185,42 @@ class Transcriber:
         self.device = ""
         self.compute_type = ""
         self.model_name = ""
+        # (model, compute type) the loaded model was asked for with; compute_type above is the
+        # one in use ("auto" resolved). None while nothing is loaded.
+        self.choice: tuple[str, str] | None = None
 
-    def load(self, model_name: str, device: str = "auto", compute_type: str = "auto") -> None:
+    def load(
+        self,
+        model_name: str,
+        device: str = "auto",
+        compute_type: str = "auto",
+        fallback: tuple[str, str] | None = None,
+    ) -> None:
+        """Load a model. `fallback` is a (model, compute type) to load instead when that fails.
+
+        The status stays "loading" until the outcome of both is known: whatever waits for the
+        model (see server.wait_for_model) must not act on a failure that is about to be repaired.
+        """
+        self.status = "loading"
+        error = self._load(model_name, device, compute_type)
+        if error and fallback and fallback != (model_name, compute_type):
+            first = error
+            error = self._load(fallback[0], device, fallback[1])
+            if error:
+                error = f"{first}; {error}"
+            else:
+                self.error = f"{model_name}（{compute_type}）加载失败，已换回 {fallback[0]}（{fallback[1]}）。{first}"
+        if error:
+            self.model, self.choice = None, None
+            self.error = "模型加载失败：" + error
+            self.status = "error"
+        else:
+            self.status = "ready"
+
+    def _load(self, model_name: str, device: str, compute_type: str) -> str:
+        """Try to load a model: "" when it is loaded, else what went wrong."""
         from faster_whisper import WhisperModel
 
-        self.status = "loading"
         self.model_name = model_name
         attempts = []
         if device in ("auto", "cuda"):
@@ -204,15 +235,14 @@ class Transcriber:
                 # Warm up so the first real segment doesn't pay CUDA init / kernel load.
                 list(model.transcribe(np.zeros(16000, dtype=np.float32), language="en", beam_size=1)[0])
                 self.model, self.device, self.compute_type = model, dev, ct
-                self.status = "ready"
+                self.choice = (model_name, compute_type)
                 self.error = "" if dev == "cuda" or device == "cpu" else "未能使用 GPU，已回退到 CPU：" + "; ".join(errors)
                 log.info("Loaded %s on %s/%s in %.1fs", model_name, dev, ct, time.time() - t0)
-                return
+                return ""
             except Exception as e:  # noqa: BLE001 - report any backend failure and try the next one
                 log.exception("Failed to load %s on %s/%s", model_name, dev, ct)
                 errors.append(f"{dev}: {e}")
-        self.status = "error"
-        self.error = "模型加载失败：" + "; ".join(errors)
+        return "; ".join(errors)
 
     def pick_language(self, audio: np.ndarray, among: tuple[str, ...] | None = LANGS) -> tuple[str, float]:
         """Most likely language of the audio, restricted to `among` (None = any), and its
