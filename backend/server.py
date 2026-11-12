@@ -12,6 +12,8 @@ import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
+
 from asr import setup_cuda_dlls
 
 setup_cuda_dlls()  # must run before ctranslate2 is imported
@@ -21,10 +23,12 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # no
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
+from starlette.websockets import WebSocketState  # noqa: E402
 
 from asr import Transcriber  # noqa: E402
+from guard import LocalOnlyMiddleware  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
-from vad import Segmenter, SegmenterParams, SileroModel  # noqa: E402
+from vad import FRAME, Segment, Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
 from asr import IT_EN, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
 from translate import DEFAULT_DOMAIN  # noqa: E402
@@ -39,6 +43,9 @@ DEVICE = os.environ.get("LIVETRANS_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
 # Set LIVETRANS_RECORD=1 to save each capture's raw 16 kHz audio to recordings/ (for tuning).
 RECORD = os.environ.get("LIVETRANS_RECORD", "") == "1"
+# Host names (besides localhost and IP addresses) the page may be opened under, comma-separated,
+# e.g. this PC's network name when LIVETRANS_HOST=0.0.0.0. See guard.py.
+ALLOWED_HOSTS = frozenset(os.environ.get("LIVETRANS_ALLOWED_HOSTS", "").split(","))
 RECORDINGS = ROOT / "recordings"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,6 +57,21 @@ transcriber = Transcriber()
 translator: Translator | None = None
 vad_model: SileroModel | None = None
 gpu_lock = asyncio.Lock()
+
+
+async def to_thread_to_end(fn, *args):
+    """asyncio.to_thread for Whisper calls made under gpu_lock.
+
+    A thread can't be cancelled. If the awaiting task is (the page disconnected), keep waiting
+    until the thread has really finished before passing the cancellation on, so the caller's
+    `async with gpu_lock` holds the lock until then and the next call can't overlap it on the GPU.
+    """
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        raise
 clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
@@ -97,6 +119,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# Other websites open in the browser must not reach /ws or the API (see guard.py).
+app.add_middleware(LocalOnlyMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 @app.get("/api/languages")
@@ -192,6 +216,59 @@ PARTIAL_MIN_AUDIO_S = 0.8
 PARTIAL_LANG_LOCK_S = 2.0
 # How often the live speech probability is sent to the status bar.
 VAD_LEVEL_INTERVAL_S = 0.25
+# Catching up: when the final transcriptions fall behind the speaker (slow GPU / CPU), segments
+# that queued up are transcribed together in one pass. Whisper's encoder costs about the same for
+# 1 s or 28 s of audio and dominates the time (beam size barely matters), so 3 segments merged
+# take ~1.3x one segment instead of 3x. Only done once MERGE_BACKLOG segments wait behind the one
+# about to be transcribed, because a merged pass detects the language once (auto mode) and loses
+# the per-segment split.
+MERGE_BACKLOG = 2
+MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
+MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
+# While the Whisper model is still loading, queued speech waits; status is checked this often.
+MODEL_WAIT_POLL_S = 0.2
+# A failed final transcription is retried this many times in all, this long apart, before its
+# audio is given up (and stops being kept for resending, see ws_audio).
+TRANSCRIBE_ATTEMPTS = 3
+TRANSCRIBE_RETRY_S = 1.0
+
+
+def merge_segments(items: list[Segment]) -> Segment:
+    """One segment holding the audio of consecutive segments; carries the last one's index."""
+    if len(items) == 1:
+        return items[0]
+    gap = np.zeros(round(MERGE_GAP_S * 16000), dtype=np.float32)
+    parts = []
+    for i, s in enumerate(items):
+        if i:
+            parts.append(gap)
+        parts.append(s.audio)
+    return Segment(start=items[0].start, audio=np.concatenate(parts), index=items[-1].index, run=items[0].run)
+
+
+def span_s(items: list[Segment]) -> float:
+    """Seconds from the first segment's start to the end of the last one's audio: the real time
+    the batch covers (merge_segments' audio has fixed short gaps instead of the real pauses)."""
+    last = items[-1]
+    return last.start + len(last.audio) / 16000 - items[0].start
+
+
+def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Segment | None]:
+    """The segments to transcribe next: just `first`, or, when MERGE_BACKLOG or more wait behind it,
+    as many queued ones as fit in MERGE_MAX_S. A taken segment that doesn't fit, or that belongs to
+    another capture run (开始 pressed again meanwhile), is returned as carry."""
+    items = [first]
+    if queue.qsize() < MERGE_BACKLOG:
+        return items, None
+    total = len(first.audio)
+    while not queue.empty():
+        nxt = queue.get_nowait()
+        total += round(MERGE_GAP_S * 16000) + len(nxt.audio)
+        if total > MERGE_MAX_S * 16000 or nxt.run != first.run:
+            return items, nxt
+        items.append(nxt)
+    return items, None
+
 
 
 def open_recording() -> wave.Wave_write:
@@ -217,30 +294,122 @@ async def ws_audio(ws: WebSocket) -> None:
     live = {"busy": False, "last_frame": 0, "final_sent": 0, "lang_index": 0, "lang": ""}
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
 
-    async def worker() -> None:
-        while True:
-            item = await queue.get()
-            if transcriber.status != "ready":
-                await ws.send_json({"type": "error", "message": "模型尚未就绪，这段语音被跳过"})
-                continue
+    in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
+    # Capture run, set by every "start" (the page numbers its runs); tags queued segments (see
+    # take_batch) and is echoed in their results, so a run that is still being transcribed after
+    # 开始 was pressed again keeps its own time base on the page and can't touch the new run's state.
+    run = [0]
+
+    # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
+    # resends it from the last "committed" position, i.e. the point before which every segment
+    # has been answered (or was silence). Positions are samples since the page pressed 开始.
+    # run -> position of that run's first sample on this connection (set by "resume"). Per run:
+    # a reconnecting page may resend several runs, and a run's segments can still be transcribed
+    # after the next run began.
+    bases: dict[int, int] = {}
+    unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
+
+    def committed() -> int:
+        pos = seg.committed_frames() * FRAME
+        mine = [p for (r, _), p in unsent.items() if r == run[0]]
+        if mine:
+            pos = min(pos, min(mine))
+        return bases.get(run[0], 0) + pos
+
+    async def send_run_done(r: int) -> None:
+        # An ended run (开始 pressed again, or the next run resumed) whose segments are all
+        # answered: the page can drop the audio it kept for it.
+        if r != run[0] and not any(k[0] == r for k in unsent):
+            await ws.send_json({"type": "run_done", "run": r})
+
+    def commit_info() -> dict:
+        # The run the position belongs to: a message sent before a "start" was processed may reach
+        # the page after it started the new run, and must not move that run's resend cursor.
+        return {"committed": committed(), "committed_run": run[0]}
+
+    async def send_backlog() -> None:
+        # Segments waiting for (or in) their final transcription; the UI warns when it grows.
+        await ws.send_json(
+            {"type": "backlog", "pending": queue.qsize() + in_hand[0], **commit_info()}
+        )
+
+    async def transcribe_batch(items: list[Segment]) -> None:
+        if transcriber.status != "ready":
+            answered(items)
+            await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
+            return
+        item = merge_segments(items)
+        # Answering a batch advances "committed", and the page then drops the kept audio. So a
+        # failure (e.g. a transient CUDA error) is retried before the batch is given up.
+        for attempt in range(1, TRANSCRIBE_ATTEMPTS + 1):
             try:
                 async with gpu_lock:
-                    res = await asyncio.to_thread(
+                    res = await to_thread_to_end(
                         transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
                     )
+                break
             except Exception as e:  # noqa: BLE001
-                log.exception("Transcription failed")
-                await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
-                continue
-            res.update(
-                type="segment",
-                index=item.index,
-                start=round(item.start, 3),
-                duration=round(len(item.audio) / 16000, 2),
-            )
+                log.exception("Transcription failed (attempt %d of %d)", attempt, TRANSCRIBE_ATTEMPTS)
+                if attempt == TRANSCRIBE_ATTEMPTS:
+                    answered(items)
+                    await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
+                    return
+                await asyncio.sleep(TRANSCRIBE_RETRY_S)
+        answered(items)
+        res.update(
+            type="segment",
+            index=item.index,
+            start=round(item.start + bases.get(item.run, 0) / 16000, 3),
+            # Sent with the result itself: if the connection drops right after, the page won't
+            # resend (and show twice) the audio of a sentence it already has.
+            **commit_info(),
+            duration=round(span_s(items), 2),
+            merged=len(items),
+            run=item.run,
+        )
+        if item.run == run[0]:  # an older run's indices mean nothing for the current one
             live["final_sent"] = max(live["final_sent"], item.index)
-            log.info("[%s %.2fs %dms] %s", res["lang"], res["duration"], res["asr_ms"], res["text"])
-            await ws.send_json(res)
+        log.info(
+            "[%s %.2fs %dms%s] %s",
+            res["lang"], res["duration"], res["asr_ms"],
+            f" merged {len(items)}" if len(items) > 1 else "", res["text"],
+        )
+        await ws.send_json(res)
+
+    def answered(items: list[Segment]) -> None:
+        for it in items:
+            unsent.pop((it.run, it.index), None)
+
+    async def wait_for_model() -> None:
+        # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
+        # keep that speech queued and transcribe it (merged, see take_batch) once the model is
+        # ready, instead of dropping it. The page shows the backlog meanwhile.
+        if transcriber.status in ("idle", "loading"):
+            await send_backlog()
+            while transcriber.status in ("idle", "loading"):
+                await asyncio.sleep(MODEL_WAIT_POLL_S)
+
+    async def worker() -> None:
+        carry: Segment | None = None
+        while True:
+            try:
+                first = carry or await queue.get()
+                carry = None
+                in_hand[0] = 1
+                await wait_for_model()
+                items, carry = take_batch(first, queue)
+                in_hand[0] = len(items) + (carry is not None)
+                try:
+                    await transcribe_batch(items)
+                    await send_run_done(items[0].run)
+                finally:
+                    in_hand[0] = carry is not None
+                await send_backlog()
+            except Exception:  # noqa: BLE001 - one bad batch must not stop transcription for good
+                if ws.client_state != WebSocketState.CONNECTED:
+                    return  # the page went away; ws_audio cancels this task anyway
+                log.exception("ASR worker failed on a batch; continuing")
+                carry, in_hand[0] = None, 0
 
     # Bumped whenever the recognition language mode changes. A partial that started under an
     # older mode (it runs in a worker thread) neither caches the language it detected nor shows
@@ -270,7 +439,7 @@ async def ws_audio(ws: WebSocket) -> None:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
-                text = await asyncio.to_thread(partial_job, audio, index)
+                text = await to_thread_to_end(partial_job, audio, index)
             if text and index > live["final_sent"]:
                 await ws.send_json({"type": "partial", "index": index, "text": text})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
@@ -291,8 +460,12 @@ async def ws_audio(ws: WebSocket) -> None:
             return
         live["busy"] = True
         live["last_frame"] = seg.frames_seen
-        asyncio.create_task(run_partial(audio, seg.index))
+        # The event loop only keeps weak references to tasks: hold one until it is done.
+        t = asyncio.create_task(run_partial(audio, seg.index))
+        partial_tasks.add(t)
+        t.add_done_callback(partial_tasks.discard)
 
+    partial_tasks: set[asyncio.Task] = set()
     task = asyncio.create_task(worker())
     speaking = False
     last_level = 0.0
@@ -312,17 +485,25 @@ async def ws_audio(ws: WebSocket) -> None:
                     if rec[0] is None:
                         rec[0] = open_recording()
                     rec[0].writeframes(msg["bytes"])
-                for s in seg.feed(msg["bytes"]):
+                new = seg.feed(msg["bytes"])
+                for s in new:
+                    s.run = run[0]
+                    unsent[(s.run, s.index)] = round(s.start * 16000)
                     queue.put_nowait(s)
+                if new:
+                    await send_backlog()
                 for index in seg.take_dropped():
                     await ws.send_json({"type": "partial_drop", "index": index})
                 now = time.monotonic()
                 if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
                     speaking = seg.speaking
                     last_level = now
-                    await ws.send_json(
-                        {"type": "vad", "speaking": speaking, "prob": round(seg.take_peak_prob(), 2)}
-                    )
+                    await ws.send_json({
+                        "type": "vad",
+                        "speaking": speaking,
+                        "prob": round(seg.take_peak_prob(), 2),
+                        **commit_info(),
+                    })
                 maybe_partial()
             elif msg.get("text"):
                 data = json.loads(msg["text"])
@@ -342,13 +523,26 @@ async def ws_audio(ws: WebSocket) -> None:
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
-                elif kind == "start":
+                elif kind in ("start", "resume"):
+                    # "resume": a reconnecting page continues its stream at `offset` and resends
+                    # the audio from there; segment start times continue from that position.
+                    old = run[0]
+                    r = data.get("run")
+                    run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
+                    bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
+                    if old and old != run[0]:  # 0: no run yet on this connection
+                        await send_run_done(old)
                 elif kind == "stop":
                     close_recording()
-                    for s in seg.flush():
+                    new = seg.flush()
+                    for s in new:
+                        s.run = run[0]
+                        unsent[(s.run, s.index)] = round(s.start * 16000)
                         queue.put_nowait(s)
+                    if new:
+                        await send_backlog()
                     for index in seg.take_dropped():
                         await ws.send_json({"type": "partial_drop", "index": index})
                     speaking = False
@@ -359,6 +553,8 @@ async def ws_audio(ws: WebSocket) -> None:
         close_recording()
         clients.discard(ws)
         task.cancel()
+        for t in partial_tasks:
+            t.cancel()
 
 
 class NoCacheStaticFiles(StaticFiles):

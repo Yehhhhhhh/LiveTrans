@@ -81,6 +81,8 @@ const state = {
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
   streamStartWall: 0,
+  run: 0, // capture run sent with every 'start'; the backend echoes it in its results
+  runWall: new Map(), // run -> its streamStartWall, for results of a run that already ended
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
@@ -104,6 +106,22 @@ function showVad(msg) {
   }
   setPill(el, text, msg.speaking ? 'speaking' : '');
   el.title = '人声概率高于阈值才会开始识别。老师说话时人声值总低于阈值，就把「语音判定阈值」调低一些。';
+}
+
+// Time of the last final transcription, plus the backlog once the GPU falls behind the speaker
+// (pending counts the segment being transcribed, so 1 is normal).
+const asrStat = { ms: null, merged: 1, pending: 0 };
+function showAsr() {
+  const el = $('stAsr');
+  let text = asrStat.ms == null ? '识别：-' : `识别：${asrStat.ms} ms`;
+  if (asrStat.merged > 1) text += ` · 合并 ${asrStat.merged} 段追赶`;
+  const behind = asrStat.pending >= 2;
+  if (behind) text += ` · 待识别 ${asrStat.pending} 段`;
+  const warn = behind || asrStat.merged > 1;
+  setPill(el, text, warn ? 'warn' : asrStat.ms == null ? '' : 'ok');
+  el.title = warn
+    ? '识别速度跟不上说话速度，字幕会滞后。积压时自动把排队的几段合并成一次识别来追赶进度（自动语种时合并的几段共用一个语种）。经常出现可在「设置 → 识别」关闭逐词实时显示，或换用更小的模型。'
+    : '';
 }
 
 // Messages pop up as a toast at the top centre. They fade after a while, except the
@@ -234,6 +252,91 @@ function wsSend(obj) {
 
 const sendConfig = debounce(() => wsSend(asrConfig()), 300);
 
+// Resuming after a dropped connection (backend restarted, network blip). Audio sent to the
+// backend is kept until the backend reports it "committed": every segment in it answered, or
+// silence. Audio captured while the connection is down is kept as well. On reconnect the stream
+// resumes at the committed position and the kept audio is sent again, so what was said around
+// the drop is still transcribed, with its own timestamps. At most RESEND_MAX_S is kept.
+// Positions count samples (16 kHz) since 开始.
+const RESEND_MAX_S = 120;
+// A stopped run whose last speech was still being transcribed when 开始 was pressed again keeps
+// its audio here until the backend reports the run done ("run_done"); at most this many runs.
+const STOPPED_RUNS_MAX = 5;
+const newResend = () => ({ chunks: [], pos: 0, committed: 0 });
+let resend = newResend(); // the current run
+const stoppedResend = new Map(); // run -> its buffer, for runs ended with unanswered audio
+
+const unanswered = (buf) => buf.chunks.length > 0 && buf.committed < buf.pos;
+
+// Called by start() before the new run is numbered: keep what the ending run still needs.
+function resetResend() {
+  if (unanswered(resend)) {
+    stoppedResend.set(state.run, resend);
+    while (stoppedResend.size > STOPPED_RUNS_MAX) stoppedResend.delete(stoppedResend.keys().next().value);
+  }
+  resend = newResend();
+}
+
+function trimResend(buf = resend) {
+  const c = buf.chunks;
+  while (c.length && c[0].pos + c[0].pcm.length <= buf.committed) c.shift();
+  while (c.length && buf.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
+}
+
+function sendAudio(pcm) {
+  resend.chunks.push({ pos: resend.pos, pcm });
+  resend.pos += pcm.length;
+  trimResend();
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(pcm);
+}
+
+function onCommitted(pos, run) {
+  const buf = run === state.run ? resend : stoppedResend.get(run);
+  if (!buf || pos <= buf.committed) return;
+  buf.committed = pos;
+  trimResend(buf);
+}
+
+// Continue a run's stream where the backend can pick it up and resend its kept audio. Its
+// results keep the run's clock (start times continue from `from`). Returns seconds resent / lost.
+function resumeStream(buf = resend, run = state.run) {
+  const first = buf.chunks[0];
+  const from = Math.max(buf.committed, first ? first.pos : buf.pos);
+  const lost = (from - buf.committed) / 16000;
+  wsSend({ type: 'resume', offset: from, run });
+  buf.committed = from;
+  let sent = 0;
+  for (const ch of buf.chunks) {
+    if (ch.pos + ch.pcm.length <= from) continue;
+    const part = ch.pos >= from ? ch.pcm : ch.pcm.subarray(from - ch.pos);
+    state.ws.send(part);
+    sent += part.length;
+  }
+  return { sent: sent / 16000, lost };
+}
+
+// On reconnect: resend the stopped runs' unanswered speech (each stopped again), then continue
+// the current run, so nothing said around the drop is lost.
+function resumeAll() {
+  const stopped = [...stoppedResend].sort((a, b) => a[0] - b[0]);
+  if (!state.running && !stopped.length && !unanswered(resend)) return;
+  let sent = 0;
+  let lost = 0;
+  const add = (r) => {
+    sent += r.sent;
+    lost += r.lost;
+  };
+  for (const [run, buf] of stopped) {
+    add(resumeStream(buf, run));
+    wsSend({ type: 'stop' });
+  }
+  // Always end on the current run: it makes the backend report the stopped runs done.
+  add(resumeStream());
+  if (!state.running) wsSend({ type: 'stop' });
+  if (lost >= 1) showMsg(`断线超过 ${RESEND_MAX_S / 60} 分钟，约 ${Math.round(lost)} 秒语音未能补回`);
+  else if (sent >= 1) showMsg(`已重新连接，补发断线前后约 ${Math.round(sent)} 秒语音`);
+}
+
 function connectWs() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
@@ -242,12 +345,13 @@ function connectWs() {
   ws.onopen = () => {
     state.wsReady = true;
     setPill($('stWs'), '后端：已连接', 'ok');
+    // A new connection starts with an empty queue (a dropped one's backlog is gone),
+    // so neither the backlog nor the last merge note applies any more.
+    asrStat.pending = 0;
+    asrStat.merged = 1;
+    showAsr();
     wsSend(asrConfig());
-    if (state.running) {
-      // Backend restarted mid-capture: restart its stream clock.
-      wsSend({ type: 'start' });
-      state.streamStartWall = Date.now();
-    }
+    resumeAll();
     loadOtherLangs(); // in case the backend wasn't up when the page loaded
   };
 
@@ -264,6 +368,12 @@ function connectWs() {
     } catch {
       return;
     }
+    // Each position goes to its own run's buffer: an earlier run's would drop this run's audio.
+    if (typeof msg.committed === 'number') onCommitted(msg.committed, msg.committed_run);
+    if (msg.type === 'run_done') {
+      stoppedResend.delete(msg.run);
+      return;
+    }
     if (msg.type === 'status') onStatus(msg);
     else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);
@@ -274,8 +384,23 @@ function connectWs() {
       if (live.index === msg.index) resetLive();
       partialEl(msg.index)?.remove();
     }
-    else if (msg.type === 'error') showMsg(msg.message);
+    else if (msg.type === 'backlog') {
+      asrStat.pending = msg.pending;
+      if (!msg.pending) asrStat.merged = 1; // caught up: the merge note no longer applies
+      showAsr();
+    } else if (msg.type === 'error') showMsg(msg.message);
   };
+}
+
+// A new capture run on the backend, with its own stream clock. Runs stopped earlier may still be
+// transcribing (model loading, backlog): their results keep their own clock and stay out of the
+// current run's live state.
+function startRun() {
+  state.run += 1;
+  state.streamStartWall = Date.now();
+  state.runWall.set(state.run, state.streamStartWall);
+  for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
+  wsSend({ type: 'start', run: state.run });
 }
 
 function onStatus(msg) {
@@ -290,13 +415,20 @@ function onStatus(msg) {
 
 async function onSegment(msg) {
   const text = (msg.text || '').trim();
-  // Partials of earlier segments can no longer be finalized.
-  transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
-    if (Number(el.dataset.pidx) < msg.index) el.remove();
-  });
+  // A result of an earlier run: its indices don't refer to the current run's partials.
+  const current = msg.run === undefined || msg.run === state.run;
+  const wall = current ? state.streamStartWall : state.runWall.get(msg.run) ?? state.streamStartWall;
+  if (current) {
+    // Partials of earlier segments can no longer be finalized.
+    transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
+      if (Number(el.dataset.pidx) < msg.index) el.remove();
+    });
+  }
   if (!text || !state.session) {
-    if (live.index <= msg.index) resetLive();
-    partialEl(msg.index)?.remove();
+    if (current) {
+      if (live.index <= msg.index) resetLive();
+      partialEl(msg.index)?.remove();
+    }
     return;
   }
   // One line per sentence; timestamps are spread over the segment by text length.
@@ -307,7 +439,7 @@ async function onSegment(msg) {
     const seg = {
       id: crypto.randomUUID(),
       sessionId: state.session.id,
-      ts: state.streamStartWall + (msg.start + (msg.duration * offset) / total) * 1000,
+      ts: wall + (msg.start + (msg.duration * offset) / total) * 1000,
       lang: msg.lang,
       text: s,
       translation: '',
@@ -317,12 +449,14 @@ async function onSegment(msg) {
     offset += s.length;
     return seg;
   });
-  setPill($('stAsr'), `识别：${msg.asr_ms} ms`, 'ok');
-  if (settings.tr.enabled) takeLive(segs, msg.index);
+  asrStat.ms = msg.asr_ms;
+  asrStat.merged = msg.merged || 1;
+  showAsr();
+  if (settings.tr.enabled && current) takeLive(segs, msg.index);
   if (segs.some((s) => s.trStatus === 'done')) {
     setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
   }
-  let prev = partialEl(msg.index);
+  let prev = current ? partialEl(msg.index) : null;
   segs.forEach((seg, i) => {
     state.segments.push(seg);
     prev = i === 0 ? renderSeg(seg, prev) : renderSeg(seg, null, prev);
@@ -1040,7 +1174,7 @@ async function start() {
 
   const meter = $('meterBar');
   node.port.onmessage = (e) => {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(e.data.pcm.buffer);
+    sendAudio(e.data.pcm);
     meter.style.width = `${Math.min(100, e.data.rms * 400)}%`;
   };
 
@@ -1050,8 +1184,8 @@ async function start() {
   resetLive();
   transcriptEl.querySelectorAll('.seg.live').forEach((el) => el.remove());
   wsSend(asrConfig());
-  wsSend({ type: 'start' });
-  state.streamStartWall = Date.now();
+  resetResend();
+  startRun();
   $('startBtn').textContent = '停止';
   $('startBtn').classList.add('running');
   if (src !== 'system') listMics();
