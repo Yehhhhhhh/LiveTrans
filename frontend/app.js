@@ -9,11 +9,22 @@ const DEFAULTS = {
   micDeviceId: '',
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
-  asr: { language: 'auto', vadThreshold: 0.5, minSilenceMs: 600, maxSegmentS: 8, glossaryPrompt: true, partial: true },
+  asr: {
+    language: 'it_en',
+    lastOther: 'fr',
+    vadThreshold: 0.5,
+    minSilenceMs: 600,
+    maxSegmentS: 8,
+    glossaryPrompt: true,
+    // Course name in the lecture's language, put before the glossary terms in the Whisper prompt.
+    hint: 'Lezione di telecomunicazioni / Telecommunications lecture',
+    partial: true,
+  },
   tr: {
     enabled: true,
     live: true,
     useLocal: false, // overrides provider with the local Ollama model
+    domain: '通信工程', // course domain named in the translation prompt; '' = unspecified
     local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
     provider: 'openai',
     contextSize: 3,
@@ -55,6 +66,8 @@ function saveJson(key, value) {
 
 const settings = deepMerge(DEFAULTS, loadJson('livetrans.settings'));
 const saveSettings = () => saveJson('livetrans.settings', settings);
+// Before "自动（所有语言）" existed, "auto" meant Italian / English: keep what it did.
+if (settings.asr.language === 'auto') settings.asr.language = 'it_en';
 
 let glossary = loadJson('livetrans.glossary');
 const saveGlossary = () => saveJson('livetrans.glossary', glossary);
@@ -177,7 +190,12 @@ async function ensureGlossary() {
 // Whisper prompt: newest (user-added) terms first, within a character budget
 // so the 224-token prompt window isn't overflowed.
 function buildAsrPrompt() {
-  if (!settings.asr.glossaryPrompt || !glossary) return '';
+  // Format "<hint>. <term>, <term>.", or "<hint>. " alone when there are no terms (empty glossary,
+  // or 用术语表提示识别 off): the backend reads the hint as the text before the first ". "
+  // (asr.split_prompt) to spot Whisper reciting it. An empty hint leaves just the terms.
+  const hint = (settings.asr.hint || '').trim().replace(/[\s.]+$/, '');
+  const head = hint ? `${hint}. ` : '';
+  if (!settings.asr.glossaryPrompt || !glossary) return head;
   const seen = new Set();
   const terms = [];
   let len = 0;
@@ -190,7 +208,7 @@ function buildAsrPrompt() {
       len += k.length + 2;
     }
   }
-  return terms.length ? `Lezione di telecomunicazioni / Telecommunications lecture. ${terms.join(', ')}.` : '';
+  return terms.length ? `${head}${terms.join(', ')}.` : head;
 }
 
 function escapeRe(s) {
@@ -334,6 +352,7 @@ function connectWs() {
     showAsr();
     wsSend(asrConfig());
     resumeAll();
+    loadOtherLangs(); // in case the backend wasn't up when the page loaded
   };
 
   ws.onclose = () => {
@@ -489,6 +508,7 @@ function translationRequest(text, context) {
     text,
     context,
     glossary: relevantGlossary([text, ...context.map((c) => c.src)]),
+    domain: (settings.tr.domain || '').trim(),
   };
 }
 
@@ -1277,6 +1297,7 @@ bind('clKey', 'tr.claude.apiKey');
 bind('clModel', 'tr.claude.model');
 bind('clEffort', 'tr.claude.effort');
 bind('trContext', 'tr.contextSize');
+bind('trDomain', 'tr.domain');
 bind('locBase', 'tr.local.baseUrl');
 bind('locModel', 'tr.local.model');
 updateProviderFields();
@@ -1318,11 +1339,79 @@ bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => {
 });
 if (settings.tr.useLocal) warmupLocal();
 
-bind('asrLang', 'asr.language', sendConfig);
+// Recognition language: four fixed choices, or "其他…" plus one language from Whisper's list.
+const ASR_LANG_MAIN = ['any', 'it', 'en', 'it_en'];
+const langName = (() => {
+  let names = null;
+  try {
+    names = new Intl.DisplayNames(['zh-CN'], { type: 'language' });
+  } catch {
+    /* old browser: codes only */
+  }
+  return (code) => {
+    const n = names?.of(code);
+    return n && n !== code ? `${n} (${code})` : code;
+  };
+})();
+
+function addOtherLangOption(code) {
+  const sel = $('asrLangOther');
+  if ([...sel.options].some((o) => o.value === code)) return;
+  sel.append(new Option(langName(code), code));
+}
+
+function showAsrLang() {
+  const v = settings.asr.language;
+  const main = ASR_LANG_MAIN.includes(v) ? v : 'other';
+  $('asrLang').value = main;
+  $('asrLangOtherField').classList.toggle('hidden', main !== 'other');
+  if (main === 'other') {
+    addOtherLangOption(v); // shown even before the list has loaded
+    $('asrLangOther').value = v;
+  }
+}
+
+function setAsrLang(v) {
+  settings.asr.language = v;
+  if (!ASR_LANG_MAIN.includes(v)) settings.asr.lastOther = v; // offered again next time "其他…" is picked
+  saveSettings();
+  showAsrLang();
+  sendConfig();
+}
+
+// The list comes from the backend (Whisper's languages); Italian and English have their own entries.
+async function loadOtherLangs() {
+  const sel = $('asrLangOther');
+  if (sel.dataset.loaded) return;
+  try {
+    const { languages } = await (await fetch('/api/languages')).json();
+    const keep = settings.asr.language;
+    sel.textContent = '';
+    languages
+      .filter((c) => c !== 'it' && c !== 'en')
+      .map((c) => [langName(c), c])
+      .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
+      .forEach(([name, c]) => sel.append(new Option(name, c)));
+    sel.dataset.loaded = '1';
+    if (!ASR_LANG_MAIN.includes(keep)) addOtherLangOption(keep);
+    showAsrLang();
+  } catch {
+    /* backend not up yet: retried when the WebSocket connects */
+  }
+}
+
+$('asrLang').addEventListener('change', () => {
+  const v = $('asrLang').value;
+  setAsrLang(v === 'other' ? settings.asr.lastOther || 'fr' : v);
+});
+$('asrLangOther').addEventListener('change', () => setAsrLang($('asrLangOther').value));
+showAsrLang();
+loadOtherLangs();
 bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);
 bind('asrGlossary', 'asr.glossaryPrompt', sendConfig);
+bind('asrHint', 'asr.hint', sendConfig);
 bind('asrPartial', 'asr.partial', sendConfig);
 
 const showGain = () => {
