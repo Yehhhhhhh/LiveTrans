@@ -164,6 +164,10 @@ body.hide-orig .seg .orig { display: none; }
 .field input, .field select { color: var(--text); }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .hint { color: var(--muted); font-size: 12px; margin: 0; word-break: break-all; }
+.sect { display: flex; flex-direction: column; gap: 10px; }
+.sect + .sect { padding-top: 14px; border-top: 1px solid var(--border); }
+.sect h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text); }
+.sub-fields { display: flex; flex-direction: column; gap: 10px; }
 
 .gl-table-wrap { overflow: auto; flex: 1; border: 1px solid var(--border); border-radius: 6px; }
 .gl-table { width: 100%; border-collapse: collapse; font-size: 13px; }

@@ -90,79 +90,114 @@
     </div>
 
     <section class="pane" data-pane="tr">
-      <label class="row"><input type="checkbox" id="trEnabled"> 启用翻译</label>
-      <label class="row"><input type="checkbox" id="trLive"> 说话时提前翻译（需开启“逐词实时显示”；译文更早出现，但 API 调用次数会增加数倍）</label>
-      <label class="field">课程领域 <input id="trDomain" type="text" maxlength="100" placeholder="例如 通信工程、机器学习、经济学"></label>
-      <p class="hint">告诉翻译模型这是什么课，帮助它理解专业内容；留空则不指定。</p>
-      <label class="field">服务商
-        <select id="trProvider">
-          <option value="openai">OpenAI 兼容接口</option>
-          <option value="claude">Claude (Anthropic)</option>
-        </select>
-      </label>
-      <div id="openaiFields">
-        <label class="field">Base URL
-          <input id="oaBase" placeholder="https://api.openai.com/v1">
-        </label>
-        <p class="hint">DeepSeek：https://api.deepseek.com/v1 · 通义：https://dashscope.aliyuncs.com/compatible-mode/v1 · Ollama：http://127.0.0.1:11434/v1</p>
-        <label class="field">API Key <input id="oaKey" type="password" autocomplete="off"></label>
-        <label class="field">模型 <input id="oaModel" placeholder="如 gpt-4o-mini / deepseek-chat / qwen-plus"></label>
+      <div class="sect">
+        <h3>基本</h3>
+        <label class="row"><input type="checkbox" id="trEnabled"> 启用翻译</label>
+        <label class="row"><input type="checkbox" id="trLive"> 说话时提前翻译（需开启“逐词实时显示”，API 调用次数会增加数倍）</label>
+        <label class="field">课程领域 <input id="trDomain" type="text" maxlength="100" placeholder="例如 通信工程、机器学习、经济学"></label>
+        <label class="field">上下文句数 <input id="trContext" type="number" min="0" max="10"></label>
       </div>
-      <div id="claudeFields">
-        <label class="field">API Key <input id="clKey" type="password" autocomplete="off"></label>
-        <label class="field">模型 <input id="clModel" list="clModels"></label>
-        <datalist id="clModels">
-          <option value="claude-opus-5-5">
-          <option value="claude-sonnet-5-5">
-          <option value="claude-haiku-5-5">
-        </datalist>
-        <label class="field">思考强度 (effort)
-          <select id="clEffort">
-            <option value="low">low（最快）</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
+
+      <div class="sect">
+        <h3>云端服务</h3>
+        <label class="field">服务商
+          <select id="trProvider">
+            <option value="openai">OpenAI 兼容接口</option>
+            <option value="claude">Claude (Anthropic)</option>
           </select>
         </label>
+        <div id="openaiFields" class="sub-fields">
+          <label class="field">Base URL
+            <input id="oaBase" placeholder="https://api.openai.com/v1">
+          </label>
+          <label class="field">API Key <input id="oaKey" type="password" autocomplete="off"></label>
+          <label class="field">模型 <input id="oaModel" placeholder="如 gpt-6-luna"></label>
+        </div>
+        <div id="claudeFields" class="sub-fields">
+          <label class="field">API Key <input id="clKey" type="password" autocomplete="off"></label>
+          <label class="field">模型 <input id="clModel" list="clModels"></label>
+          <datalist id="clModels">
+            <option value="claude-opus-5-5">
+            <option value="claude-sonnet-5-5">
+            <option value="claude-haiku-5-5">
+          </datalist>
+          <label class="field">思考强度 (effort)
+            <select id="clEffort">
+              <option value="low">low（最快）</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">API Key 只保存在本机浏览器，请求经本地后端转发。</p>
       </div>
-      <label class="row"><input type="checkbox" id="trLocal"> 使用本地模型（Ollama，开启后忽略上面的服务商）</label>
-      <label class="field">Ollama 地址 <input id="locBase" placeholder="http://127.0.0.1:11434"></label>
-      <label class="field">本地模型 <input id="locModel" placeholder="qwen3:4b-instruct-2507-q4_K_M"></label>
-      <p class="hint">需先安装 Ollama 并运行：ollama pull qwen3:4b-instruct-2507-q4_K_M。模型会常驻显存（约 3GB）。</p>
-      <label class="field">上下文句数 <input id="trContext" type="number" min="0" max="10"></label>
-      <div class="row">
-        <button id="trTest">测试翻译</button>
-        <span id="trTestOut" class="hint"></span>
+
+      <div class="sect">
+        <h3>本地模型</h3>
+        <label class="row"><input type="checkbox" id="trLocal"> 使用本地模型（Ollama，开启后忽略云端服务）</label>
+        <label class="field">Ollama 地址 <input id="locBase" placeholder="http://127.0.0.1:11434"></label>
+        <label class="field">本地模型 <input id="locModel" placeholder="qwen3:4b-instruct-2507-q4_K_M"></label>
+        <p class="hint">需先安装 Ollama 并执行 ollama pull 下载模型。</p>
       </div>
-      <p class="hint">API Key 只保存在本机浏览器，请求经本地后端转发。</p>
+
+      <div class="sect">
+        <h3>测试</h3>
+        <div class="row">
+          <button id="trTest">测试翻译</button>
+          <span id="trTestOut" class="hint"></span>
+        </div>
+      </div>
     </section>
 
     <section class="pane hidden" data-pane="asr">
-      <label class="field">识别语言
-        <select id="asrLang">
-          <option value="any">自动（所有语言）</option>
-          <option value="it">意大利语</option>
-          <option value="en">英语</option>
-          <option value="it_en">意大利语 / 英语（逐段判断）</option>
-          <option value="other">其他…</option>
-        </select>
-      </label>
-      <label class="field hidden" id="asrLangOtherField">其他语言
-        <select id="asrLangOther"></select>
-      </label>
-      <label class="field">语音判定阈值 <input id="vadThr" type="number" step="0.05" min="0.1" max="0.95"></label>
-      <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
-      <label class="field">单段最长 (秒) <input id="vadMax" type="number" step="1" min="3" max="20"></label>
-      <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
-      <label class="field">识别提示语 <input id="asrHint" type="text" maxlength="150" placeholder="例如 Lezione di economia / Economics lecture"></label>
-      <p class="hint">用讲课的语言写一句课程名称，放在术语表前面一起提示 Whisper，提高专业词识别率；术语表为空或关闭时也会单独发送。留空则不发送。</p>
-      <label class="row"><input type="checkbox" id="asrPartial"> 说话时逐词实时显示（句子结束后替换为精确结果）</label>
-      <p class="hint">句末静音越短，出字越快但句子越碎；超过单段最长会在短停顿处或强制切分。</p>
+      <div class="sect">
+        <h3>语言</h3>
+        <label class="field">识别语言
+          <select id="asrLang">
+            <option value="any">自动（所有语言）</option>
+            <option value="it">意大利语</option>
+            <option value="en">英语</option>
+            <option value="it_en">意大利语 / 英语（逐段判断）</option>
+            <option value="other">其他…</option>
+          </select>
+        </label>
+        <label class="field hidden" id="asrLangOtherField">其他语言
+          <select id="asrLangOther"></select>
+        </label>
+      </div>
+
+      <div class="sect">
+        <h3>断句</h3>
+        <label class="field">语音判定阈值 <input id="vadThr" type="number" step="0.05" min="0.1" max="0.95"></label>
+        <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
+        <label class="field">单段最长 (秒) <input id="vadMax" type="number" step="1" min="3" max="20"></label>
+        <p class="hint">句末静音越短，出字越快但句子越碎。</p>
+      </div>
+
+      <div class="sect">
+        <h3>识别提示</h3>
+        <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
+        <label class="field">识别提示语 <input id="asrHint" type="text" maxlength="150" placeholder="例如 Lezione di economia / Economics lecture"></label>
+        <p class="hint">用讲课的语言写课程名称，提高专业词识别率；留空则不发送。</p>
+      </div>
+
+      <div class="sect">
+        <h3>实时显示</h3>
+        <label class="row"><input type="checkbox" id="asrPartial"> 说话时逐词实时显示（句子结束后替换为精确结果）</label>
+      </div>
     </section>
 
     <section class="pane hidden" data-pane="audio">
-      <label class="field">麦克风增益 <input id="micGain" type="range" min="0.5" max="4" step="0.1"> <span id="micGainV"></span></label>
-      <label class="field">系统音频增益 <input id="sysGain" type="range" min="0.5" max="4" step="0.1"> <span id="sysGainV"></span></label>
-      <label class="row"><input type="checkbox" id="micProc"> 麦克风降噪 / 自动增益（浏览器内置）</label>
+      <div class="sect">
+        <h3>增益</h3>
+        <label class="field">麦克风增益 <input id="micGain" type="range" min="0.5" max="4" step="0.1"> <span id="micGainV"></span></label>
+        <label class="field">系统音频增益 <input id="sysGain" type="range" min="0.5" max="4" step="0.1"> <span id="sysGainV"></span></label>
+      </div>
+
+      <div class="sect">
+        <h3>处理</h3>
+        <label class="row"><input type="checkbox" id="micProc"> 麦克风降噪 / 自动增益（浏览器内置）</label>
+      </div>
       <p class="hint">修改后需重新「开始」才生效。</p>
     </section>
 
@@ -188,10 +223,17 @@
     </section>
 
     <section class="pane hidden" data-pane="disp">
-      <label class="row"><input type="checkbox" id="showOrig"> 显示原文</label>
-      <label class="row"><input type="checkbox" id="autoScroll"> 自动滚动到最新</label>
-      <label class="field">原文字号 <input id="origSize" type="number" min="10" max="48"></label>
-      <label class="field">译文字号 <input id="transSize" type="number" min="12" max="64"></label>
+      <div class="sect">
+        <h3>内容</h3>
+        <label class="row"><input type="checkbox" id="showOrig"> 显示原文</label>
+        <label class="row"><input type="checkbox" id="autoScroll"> 自动滚动到最新</label>
+      </div>
+
+      <div class="sect">
+        <h3>字号</h3>
+        <label class="field">原文字号 <input id="origSize" type="number" min="10" max="48"></label>
+        <label class="field">译文字号 <input id="transSize" type="number" min="12" max="64"></label>
+      </div>
     </section>
   </aside>
 
