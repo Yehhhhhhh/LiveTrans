@@ -108,12 +108,15 @@
 - VAD 看到的音频会自动放大音量（最多 20 倍），轻声、远距离的讲课也能检测到；送给 Whisper 的仍是原始音频。
 - 浏览器自带的麦克风降噪 / 自动增益默认关闭（它会把远处的人声当成噪音去掉），可在「设置 → 音频」中开启。
 - 长时间上课时定期重置 VAD 状态，避免越到后面越检测不到人声。
+- 识别跟不上说话速度时（显卡慢、显存被其他程序占用或用 CPU），状态栏「识别」会变黄，并显示「待识别 N 段」。正在识别的那段后面又排了 2 段或以上时，排队的几段会合并成一次识别来追赶（最长 24 秒），追上后黄色提示自动消失。Whisper 每次识别的耗时主要是固定开销，实测合并 3 段只比识别 1 段多花约三成时间。自动语种模式下，合并的几段共用一个语种。
+- 模型还在加载（首次启动要下载）时就点了「开始」，说的话也不会丢：语音先排队，模型就绪后再一起识别。
 - 过滤 Whisper 幻觉：连续重复的词句会合并，只有套话（如「Grazie a tutti」「Thank you」）、只在复读术语表提示、或可信度过低的段落会被丢弃。
 
 ## 记录
 
 - 所有记录自动保存在浏览器 IndexedDB 中，刷新或关闭页面不会丢失（同一浏览器、同一地址 `127.0.0.1:8765`）。
 - 每节课可「新建」一条记录，「导出 MD」导出为 Markdown。
+- **断线续传**：识别过程中后端断开（重启了 `start.bat`、后端崩溃等）时，页面继续采集并保留音频，重新连上后把后端还没处理完的语音补发过去，断线前后说的话照常出字幕，时间也接得上，已经出来的句子不会重复。最多保留 2 分钟；断线更久时，更早的部分无法补回，页面会提示丢了多少秒。刷新或关闭页面不在此列（页面里保留的音频会随之丢失）。
 
 ## 术语表
 
@@ -132,8 +135,20 @@
 | `LIVETRANS_COMPUTE_TYPE` | `auto` | Whisper 计算精度，如 `float16` / `int8_float16` / `int8` |
 | `LIVETRANS_HOST` | `127.0.0.1` | 监听地址 |
 | `LIVETRANS_PORT` | `8765` | 端口 |
+| `LIVETRANS_ALLOWED_HOSTS` | - | 除 `localhost` 和 IP 地址外，还允许用哪些主机名打开页面，逗号分隔（例如 `LIVETRANS_HOST=0.0.0.0` 时本机的网络名） |
+
+后端只接受来自自己页面的请求：浏览器里打开的其他网站不能连接 `/ws` 或调用 API（会被拒绝并在日志中记录），命令行工具、脚本不受影响。用 IP 地址或 `localhost` 打开页面都可以；用其他主机名打开时，需要把它加到 `LIVETRANS_ALLOWED_HOSTS`。
+
+注意：设置 `LIVETRANS_HOST=0.0.0.0` 让局域网访问时，同一网络中的任何人都可以使用这个后端，包括用它转发翻译请求，请只在可信网络中这样做。
 | `LIVETRANS_RECORD` | - | 设为 `1` 时把每次采集的原始 16kHz 音频保存到 `recordings/`，用于调参 |
 | `HF_ENDPOINT` | - | HuggingFace 镜像 |
+
+## 测试
+
+```
+.venv\Scripts\python -m pip install -r backend\requirements-dev.txt
+.venv\Scripts\python -m pytest backend\tests
+```
 
 ## 结构
 
@@ -144,6 +159,7 @@ backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（意/英二选一）、幻觉过滤
 backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
 backend/winfo.py       由窗口句柄查程序名、窗口标题和图标（Windows API）
+backend/tests/         pytest 单元测试（依赖见 requirements-dev.txt）
 frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB 记录
 frontend/vendor/katex/ KaTeX 公式渲染（离线）
 install.bat            创建 .venv 并安装依赖
