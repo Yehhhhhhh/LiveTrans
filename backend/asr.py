@@ -1,4 +1,4 @@
-"""faster-whisper wrapper restricted to Italian / English."""
+"""faster-whisper wrapper: Italian / English by default, any Whisper language on request."""
 
 from __future__ import annotations
 
@@ -15,6 +15,37 @@ log = logging.getLogger("livetrans.asr")
 
 LANGS = ("it", "en")
 
+# Recognition-language setting: ANY (detect among all of Whisper's languages), IT_EN (each
+# segment either Italian or English, the default), or one fixed language code.
+ANY, IT_EN = "any", "it_en"
+
+
+def all_languages() -> tuple[str, ...]:
+    """Language codes Whisper (multilingual models) can recognise."""
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+    except ImportError:  # private name; fall back to the pair this app is built around
+        return LANGS
+    return tuple(_LANGUAGE_CODES)
+
+
+def normalize_language(value: object) -> str | None:
+    """The setting as used here, or None if it isn't valid. "auto" is the old name of IT_EN."""
+    if value == "auto":
+        return IT_EN
+    if value in (ANY, IT_EN) or (isinstance(value, str) and value in all_languages()):
+        return value
+    return None
+
+
+def detect_among(mode: str) -> tuple[str, ...] | None:
+    """Languages to choose between when detecting (None = all), for a non-fixed mode."""
+    return LANGS if mode == IT_EN else None
+
+
+def is_fixed(mode: str) -> bool:
+    return mode not in (ANY, IT_EN)
+
 # Phrases Whisper tends to hallucinate on noise or silence.
 HALLUCINATIONS = re.compile(
     r"(amara\.org|sottotitoli (creati|a cura|e revisione)|grazie per (la visione|l'attenzione|aver guardato)"
@@ -30,8 +61,6 @@ STOCK_PHRASES = re.compile(
     re.I,
 )
 
-# The fixed header app.js puts before the glossary terms.
-PROMPT_HEADER_WORDS = {"lezione", "di", "telecomunicazioni", "telecommunications", "lecture"}
 # Ignored when deciding whether an output only echoes the prompt.
 FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
 _CLAUSE = re.compile(r"[.,;:!?…]+")
@@ -81,8 +110,21 @@ def collapse_repeats(text: str) -> str:
     return " ".join(out)
 
 
-def prompt_words(prompt: str) -> set[str]:
-    return set(_WORD.findall(prompt.lower())) - PROMPT_HEADER_WORDS if prompt else set()
+def split_prompt(prompt: str) -> tuple[set[str], set[str]]:
+    """Words of the course hint and of the glossary terms in a Whisper prompt.
+
+    app.js builds the prompt as "<course hint>. <term>, <term>, ..." (the hint is set in
+    设置 → 识别, default "Lezione di telecomunicazioni / Telecommunications lecture"), or just
+    "<term>, <term>, ..." when the hint is empty, or "<course hint>. " when there are no terms:
+    the hint is everything before the first ". ".
+    """
+    if not prompt:
+        return set(), set()
+    hint, sep, terms = prompt.partition(". ")
+    if not sep:
+        hint, terms = "", prompt
+    hint_words = set(_WORD.findall(hint.lower()))
+    return hint_words, set(_WORD.findall(terms.lower())) - hint_words
 
 
 def clean_text(text: str, prompt: str = "") -> str:
@@ -99,13 +141,18 @@ def clean_text(text: str, prompt: str = "") -> str:
     clauses = [" ".join(_WORD.findall(c)) for c in _CLAUSE.split(text.lower())]
     if all(STOCK_PHRASES.match(c) for c in clauses if c):
         return ""
-    # Echo of the glossary prompt: content words that all come from the prompt (or its header)
-    # are Whisper reciting its prompt, not the lecturer speaking.
+    # Echo of the glossary prompt: content words that all come from the prompt (or its course
+    # hint) are Whisper reciting its prompt, not the lecturer speaking.
     content = [w for w in words if w not in FUNCTION_WORDS]
-    vocab = prompt_words(prompt)
-    if prompt and content and all(w in PROMPT_HEADER_WORDS for w in content):
+    hint, vocab = split_prompt(prompt)
+    # Only a real echo of the hint: at least two of its content words (a hint with a single content
+    # word can't be told apart). A lecturer saying just "Economics." under the hint
+    # "Economics lecture" is speech, not an echo.
+    hint_content = hint - FUNCTION_WORDS
+    echo_min = min(2, len(hint_content))
+    if hint and content and all(w in hint for w in content) and len(set(content)) >= echo_min:
         return ""
-    if vocab and len(content) >= 3 and all(w in vocab or w in PROMPT_HEADER_WORDS for w in content):
+    if vocab and len(content) >= 3 and all(w in vocab or w in hint for w in content):
         return ""
     return text
 
@@ -167,10 +214,15 @@ class Transcriber:
         self.status = "error"
         self.error = "模型加载失败：" + "; ".join(errors)
 
-    def pick_language(self, audio: np.ndarray) -> tuple[str, float]:
+    def pick_language(self, audio: np.ndarray, among: tuple[str, ...] | None = LANGS) -> tuple[str, float]:
+        """Most likely language of the audio, restricted to `among` (None = any), and its
+        probability relative to those candidates."""
         _, _, probs = self.model.detect_language(audio)
-        scores = {lang: p for lang, p in probs if lang in LANGS}
-        lang = max(LANGS, key=lambda k: scores.get(k, 0.0))
+        if among is None:
+            lang, p = max(probs, key=lambda lp: lp[1])
+            return lang, p
+        scores = {lang: p for lang, p in probs if lang in among}
+        lang = max(among, key=lambda k: scores.get(k, 0.0))
         total = sum(scores.values()) or 1.0
         return lang, scores.get(lang, 0.0) / total
 
@@ -190,12 +242,13 @@ class Transcriber:
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
         return re.sub(r"[.…]+$", "", text).strip()
 
-    def transcribe(self, audio: np.ndarray, language: str = "auto", prompt: str = "") -> dict:
+    def transcribe(self, audio: np.ndarray, language: str = IT_EN, prompt: str = "") -> dict:
         t0 = time.time()
-        if language in LANGS:
-            lang, lang_prob = language, 1.0
+        mode = normalize_language(language) or IT_EN
+        if is_fixed(mode):
+            lang, lang_prob = mode, 1.0
         else:
-            lang, lang_prob = self.pick_language(audio)
+            lang, lang_prob = self.pick_language(audio, detect_among(mode))
         segments, _ = self.model.transcribe(
             audio,
             language=lang,

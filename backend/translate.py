@@ -9,8 +9,8 @@ from collections.abc import AsyncIterator
 import anthropic
 import httpx
 
-SYSTEM_PROMPT = """你是一名专业的同声传译员，正在为一门通信工程（telecommunications）大学课程做实时字幕翻译。
-讲者混用意大利语和英语，你要把每一段讲话翻译成自然、准确、简洁的简体中文。
+SYSTEM_PROMPT_TEMPLATE = """你是一名专业的同声传译员，正在为<COURSE>做实时字幕翻译。
+讲者通常混用意大利语和英语，也可能使用其他语言；无论原文是什么语言，你都要把每一段讲话翻译成自然、准确、简洁的简体中文。
 
 要求：
 - 只输出译文本身，不要解释、注释、引号或任何前缀。
@@ -22,6 +22,17 @@ SYSTEM_PROMPT = """你是一名专业的同声传译员，正在为一门通信�
 - 简单式子用上面的纯文本写法；求和、积分、复杂分式、上下标较多的公式改用 LaTeX，并且只用 \\( 和 \\) 包裹（界面会渲染），例如 "the sum for i from 10 to 150 of p i" 写作 \\(\\sum_{i=10}^{150} p_i\\)。不要使用其他 Markdown 格式。
 - 如果这一段只是口头语（如 "allora"、"ok"、"quindi"），给出简短的对应中文即可。
 - 上文只用于理解语境，不要重复翻译上文。"""
+
+# The course the lecture belongs to (设置 → 翻译 → 课程领域); requests without one get this.
+DEFAULT_DOMAIN = "通信工程"
+
+
+def system_prompt(domain: str | None = DEFAULT_DOMAIN) -> str:
+    """The system prompt for a course domain such as "通信工程"; empty means unspecified."""
+    d = " ".join((domain or "").split())[:100]  # one line, bounded
+    course = f"一门「{d}」大学课程" if d else "一门大学课程"
+    return SYSTEM_PROMPT_TEMPLATE.replace("<COURSE>", course)
+
 
 # Models that accept output_config.effort and the server-side refusal fallback.
 EFFORT_MODEL = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-5")
@@ -93,21 +104,36 @@ class Translator:
         for c in self._claude_clients.values():
             await c.close()
 
-    async def translate(self, provider: str, config: dict, text: str, context: list[dict], glossary: list[dict]) -> str:
-        out = "".join([d async for d in self.translate_stream(provider, config, text, context, glossary)])
+    async def translate(
+        self,
+        provider: str,
+        config: dict,
+        text: str,
+        context: list[dict],
+        glossary: list[dict],
+        domain: str | None = DEFAULT_DOMAIN,
+    ) -> str:
+        out = "".join([d async for d in self.translate_stream(provider, config, text, context, glossary, domain)])
         return clean_output(out)
 
     def translate_stream(
-        self, provider: str, config: dict, text: str, context: list[dict], glossary: list[dict]
+        self,
+        provider: str,
+        config: dict,
+        text: str,
+        context: list[dict],
+        glossary: list[dict],
+        domain: str | None = DEFAULT_DOMAIN,
     ) -> AsyncIterator[str]:
         """Yield raw text deltas of the translation as the model produces them."""
+        system = system_prompt(domain)
         user = build_user_message(text, context, glossary)
         if provider == "claude":
-            return self._claude(config, user)
+            return self._claude(config, system, user)
         if provider == "openai":
-            return self._openai(config, user)
+            return self._openai(config, system, user)
         if provider == "ollama":
-            return self._ollama(config, user)
+            return self._ollama(config, system, user)
         raise TranslateError(f"未知服务商：{provider}")
 
     @staticmethod
@@ -130,13 +156,13 @@ class Translator:
         if r.status_code >= 400:
             raise TranslateError(ollama_error(r.status_code, r.text, model))
 
-    async def _ollama(self, config: dict, user: str) -> AsyncIterator[str]:
+    async def _ollama(self, config: dict, system: str, user: str) -> AsyncIterator[str]:
         model = config.get("model") or ""
         if not model:
             raise TranslateError("请填写本地模型名")
         body = {
             "model": model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "stream": True,
             "think": False,
             # Stay loaded between sentences: a reload adds seconds; freed after an hour idle.
@@ -171,7 +197,7 @@ class Translator:
         except httpx.HTTPError as e:
             raise TranslateError(f"无法连接 Ollama（{e}），请确认 Ollama 已安装并在运行") from e
 
-    async def _openai(self, config: dict, user: str) -> AsyncIterator[str]:
+    async def _openai(self, config: dict, system: str, user: str) -> AsyncIterator[str]:
         base = (config.get("baseUrl") or "").rstrip("/")
         model = config.get("model") or ""
         if not base or not model:
@@ -181,7 +207,7 @@ class Translator:
             headers["Authorization"] = f"Bearer {config['apiKey']}"
         body = {
             "model": model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "stream": True,
         }
         key = (base, model)
@@ -223,7 +249,7 @@ class Translator:
             self._claude_clients[api_key] = client
         return client
 
-    async def _claude(self, config: dict, user: str) -> AsyncIterator[str]:
+    async def _claude(self, config: dict, system: str, user: str) -> AsyncIterator[str]:
         api_key = config.get("apiKey") or ""
         model = config.get("model") or "claude-opus-5-5"
         if not api_key:
@@ -232,7 +258,7 @@ class Translator:
         kwargs = dict(
             model=model,
             max_tokens=8000,
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": user}],
         )
         if EFFORT_MODEL.match(model):
