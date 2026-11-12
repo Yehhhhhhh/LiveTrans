@@ -417,8 +417,8 @@ function onStatus(msg) {
     const dl = msg.download;
     setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
   }
-  showDownload(msg);
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+  showDownload(msg);
   if (msg.error) showMsg(msg.error);
   showAsrModels(msg);
 }
