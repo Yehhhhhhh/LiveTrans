@@ -1361,7 +1361,9 @@ bind('locCpu', 'tr.local.cpu', () => {
   if (settings.tr.useLocal) warmupLocal(true);
 });
 bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => {
-  if (on) return warmupLocal();
+  // Reloaded: the CPU setting may have been changed while the local model was off, and the
+  // model may still be loaded where the old setting put it.
+  if (on) return warmupLocal(true);
   clearTrMsg();
   setPill($('stTr'), '翻译：-');
 });
