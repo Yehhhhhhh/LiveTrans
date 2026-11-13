@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import AsyncIterator
 
@@ -23,8 +24,8 @@ SYSTEM_PROMPT_TEMPLATE = """你是一名专业的同声传译员，正在为<COU
 - 如果这一段只是口头语（如 "allora"、"ok"、"quindi"），给出简短的对应中文即可。
 - 上文只用于理解语境，不要重复翻译上文。"""
 
-# The course the lecture belongs to (设置 → 翻译 → 课程领域); requests without one get this.
-DEFAULT_DOMAIN = "通信工程"
+# The course the lecture belongs to (设置 → 翻译 → 课程领域); blank by default, i.e. unspecified.
+DEFAULT_DOMAIN = ""
 
 
 def system_prompt(domain: str | None = DEFAULT_DOMAIN) -> str:
@@ -43,6 +44,12 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 # Glossary + context + sentence fit easily; a small window keeps VRAM free for Whisper.
 OLLAMA_CTX = 4096
 OLLAMA_KEEP_ALIVE = "1h"
+# Threads the local model gets when it runs on the CPU: few. Ollama's default is one per physical
+# core, which gains nothing (generation is limited by memory speed: 18-20 tokens/s from 2 to 16
+# threads, qwen3 4B on 16 cores / 32 threads) and slows Whisper down although that runs on the
+# GPU: while the model generated, an 8 s segment took 2.0-2.6 s with 8 threads, 1.2-1.3 s with
+# 2 or 4, 0.75-1.0 s with none. It also keeps the rest of the PC responsive.
+OLLAMA_CPU_THREADS = max(2, min(4, (os.cpu_count() or 8) // 8))
 
 
 class TranslateError(Exception):
@@ -141,15 +148,32 @@ class Translator:
         # Accept the OpenAI-style URL too; the native API lives at the root.
         return re.sub(r"/v1/?$", "", (config.get("baseUrl") or OLLAMA_URL).rstrip("/"))
 
-    async def warmup(self, config: dict) -> None:
-        """Load the local model into VRAM now and keep it there, so the first sentence isn't slow."""
+    @staticmethod
+    def _ollama_options(config: dict) -> dict:
+        options = {"num_ctx": OLLAMA_CTX}
+        if config.get("cpu"):
+            # No layers on the GPU: slower, but the model no longer shares it with Whisper, which
+            # takes about three times as long for a segment while a translation is generated there.
+            options["num_gpu"] = 0
+            options["num_thread"] = OLLAMA_CPU_THREADS
+        return options
+
+    async def warmup(self, config: dict, reload: bool = False) -> None:
+        """Load the local model now and keep it loaded, so the first sentence isn't slow.
+
+        `reload` unloads it first. Needed after the "cpu" setting was switched off: Ollama keeps
+        a model that is loaded on the CPU there, whatever later requests ask for.
+        """
         model = config.get("model") or ""
         if not model:
             raise TranslateError("请填写本地模型名")
+        url = f"{self._ollama_base(config)}/api/generate"
         try:
+            if reload:
+                await self.http.post(url, json={"model": model, "keep_alive": 0})
             r = await self.http.post(
-                f"{self._ollama_base(config)}/api/generate",
-                json={"model": model, "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"num_ctx": OLLAMA_CTX}},
+                url,
+                json={"model": model, "keep_alive": OLLAMA_KEEP_ALIVE, "options": self._ollama_options(config)},
             )
         except httpx.HTTPError as e:
             raise TranslateError(f"无法连接 Ollama（{e}），请确认 Ollama 已安装并在运行") from e
@@ -167,7 +191,7 @@ class Translator:
             "think": False,
             # Stay loaded between sentences: a reload adds seconds; freed after an hour idle.
             "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {"temperature": 0.2, "num_ctx": OLLAMA_CTX},
+            "options": {"temperature": 0.2, **self._ollama_options(config)},
         }
         url = f"{self._ollama_base(config)}/api/chat"
         try:
