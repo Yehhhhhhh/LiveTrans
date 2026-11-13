@@ -333,6 +333,23 @@ MODEL_WAIT_POLL_S = 0.2
 # audio is given up (and stops being kept for resending, see ws_audio).
 TRANSCRIBE_ATTEMPTS = 3
 TRANSCRIBE_RETRY_S = 1.0
+# Context: the end of what was just recognized is given to Whisper with the next segment (see
+# asr.fit_prompt), so a sentence cut in two, a name or a term is decoded consistently. Only this
+# much of it, and only if the next segment starts within this long: after a longer pause the
+# lecturer has usually moved on, and old text would only bias the decoding.
+CONTEXT_CHARS = 200
+CONTEXT_MAX_GAP_S = 15.0
+
+
+def context_tail(text: str) -> str:
+    """The last CONTEXT_CHARS characters of the text, starting at a word where there is one."""
+    text = " ".join(text.split())
+    if len(text) <= CONTEXT_CHARS:
+        return text
+    tail = text[-CONTEXT_CHARS:]
+    cut = tail.find(" ", 0, 40)
+    # No space near the start (Chinese, Japanese… are written without): keep the tail as it is.
+    return tail[cut + 1 :] if cut >= 0 else tail
 
 
 def merge_segments(items: list[Segment]) -> Segment:
@@ -391,7 +408,10 @@ async def ws_audio(ws: WebSocket) -> None:
     await ws.send_json(status_message())
 
     seg = Segmenter(vad_model, SegmenterParams())
-    opts = {"language": IT_EN, "prompt": "", "partial": True}
+    opts = {"language": IT_EN, "prompt": "", "partial": True, "context": True}
+    # What the last answered segment said, in which language, and when (seconds, on the same clock
+    # as a result's "start") it ended. Used as context for the next segment of the same run.
+    ctx = {"text": "", "lang": "", "run": 0, "end": 0.0}
     queue: asyncio.Queue = asyncio.Queue()
     live = {"busy": False, "last_frame": 0, "final_sent": 0, "lang_index": 0, "lang": ""}
     partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
@@ -441,13 +461,17 @@ async def ws_audio(ws: WebSocket) -> None:
             await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
             return
         item = merge_segments(items)
+        start = item.start + bases.get(item.run, 0) / 16000
+        context = ("", "")
+        if opts["context"] and ctx["run"] == item.run and 0 <= start - ctx["end"] <= CONTEXT_MAX_GAP_S:
+            context = (ctx["text"], ctx["lang"])
         # Answering a batch advances "committed", and the page then drops the kept audio. So a
         # failure (e.g. a transient CUDA error) is retried before the batch is given up.
         for attempt in range(1, TRANSCRIBE_ATTEMPTS + 1):
             try:
                 async with gpu_lock:
                     res = await to_thread_to_end(
-                        transcriber.transcribe, item.audio, opts["language"], opts["prompt"]
+                        transcriber.transcribe, item.audio, opts["language"], opts["prompt"], *context
                     )
                 break
             except Exception as e:  # noqa: BLE001
@@ -458,10 +482,20 @@ async def ws_audio(ws: WebSocket) -> None:
                     return
                 await asyncio.sleep(TRANSCRIBE_RETRY_S)
         answered(items)
+        if res["text"]:
+            # Same language and still connected to it: keep the older text too, so a short
+            # "Sì." doesn't leave the next segment with almost no context.
+            joined = context[1] == res["lang"] and context[0]
+            ctx.update(
+                text=context_tail(f"{context[0]} {res['text']}" if joined else res["text"]),
+                lang=res["lang"],
+                run=item.run,
+                end=start + span_s(items),
+            )
         res.update(
             type="segment",
             index=item.index,
-            start=round(item.start + bases.get(item.run, 0) / 16000, 3),
+            start=round(start, 3),
             # Sent with the result itself: if the connection drops right after, the page won't
             # resend (and show twice) the audio of a sentence it already has.
             **commit_info(),
@@ -622,8 +656,11 @@ async def ws_audio(ws: WebSocket) -> None:
                             opts["language"] = mode
                             mode_gen[0] += 1
                             live.update(lang_index=0, lang="")
+                        ctx.update(text="", lang="")
                     if "partial" in asr:
                         opts["partial"] = bool(asr["partial"])
+                    if "context" in asr:
+                        opts["context"] = bool(asr["context"])
                     if "model" in asr or "compute" in asr:
                         request_model(asr.get("model"), asr.get("compute"))
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
@@ -635,6 +672,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
+                    ctx.update(text="", lang="")
                     bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
                     if old and old != run[0]:  # 0: no run yet on this connection
                         await send_run_done(old)

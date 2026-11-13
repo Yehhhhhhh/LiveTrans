@@ -20,6 +20,8 @@ const DEFAULTS = {
     minSilenceMs: 600,
     maxSegmentS: 8,
     glossaryPrompt: true,
+    // Give Whisper the end of the previous sentence as context for the next one.
+    context: true,
     // Course name in the lecture's language, put before the glossary terms in the Whisper prompt.
     hint: '',
     partial: true,
@@ -248,6 +250,7 @@ function asrConfig() {
       min_silence_ms: Number(settings.asr.minSilenceMs),
       max_segment_s: Number(settings.asr.maxSegmentS),
       partial: Boolean(settings.asr.partial),
+      context: Boolean(settings.asr.context),
     },
     prompt: buildAsrPrompt(),
   };
@@ -1580,6 +1583,7 @@ bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);
 bind('asrGlossary', 'asr.glossaryPrompt', sendConfig);
 bind('asrHint', 'asr.hint', sendConfig);
+bind('asrContext', 'asr.context', sendConfig);
 bind('asrPartial', 'asr.partial', sendConfig);
 
 const showGain = () => {
