@@ -12,6 +12,10 @@ const DEFAULTS = {
   asr: {
     language: 'it_en',
     lastOther: 'fr',
+    // Whisper model and compute type (weight precision), from those the backend offers;
+    // '' is its default (LIVETRANS_MODEL, LIVETRANS_COMPUTE_TYPE).
+    model: '',
+    compute: '',
     vadThreshold: 0.5,
     minSilenceMs: 600,
     maxSegmentS: 8,
@@ -238,6 +242,8 @@ function asrConfig() {
     type: 'config',
     asr: {
       language: settings.asr.language,
+      model: settings.asr.model,
+      compute: settings.asr.compute,
       vad_threshold: Number(settings.asr.vadThreshold),
       min_silence_ms: Number(settings.asr.minSilenceMs),
       max_segment_s: Number(settings.asr.maxSegmentS),
@@ -408,10 +414,136 @@ function startRun() {
 function onStatus(msg) {
   const el = $('stModel');
   if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
-  else if (msg.model === 'loading') setPill(el, '模型：加载中（首次需下载）…', 'warn');
+  else if (msg.model === 'loading') {
+    const dl = msg.download;
+    setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
+  }
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+  showDownload(msg);
   if (msg.error) showMsg(msg.error);
+  showAsrModels(msg);
 }
+
+const MODEL_LABELS = {
+  'large-v3-turbo': 'large-v3-turbo（快）',
+  'large-v3': 'large-v3（更准，更慢，更占显存）',
+};
+const COMPUTE_LABELS = {
+  auto: '自动（GPU 用 float16，CPU 用 int8）',
+  float16: 'float16（标准）',
+  int8_float16: 'int8_float16（省显存，准确度略降）',
+  int8: 'int8（省显存，准确度略降）',
+};
+
+// Progress of a model download, shown where the messages are (below one that is showing).
+function showDownload(msg) {
+  const dl = msg.model === 'loading' ? msg.download : null;
+  const box = $('dlToast');
+  box.classList.toggle('hidden', !dl);
+  if (!dl) return;
+  const gb = (b) => (b / 1024 ** 3).toFixed(1);
+  const speed = dl.rate ? `，${(dl.rate / 1024 ** 2).toFixed(1)}MB/s` : '';
+  $('dlText').textContent = `正在下载模型 ${msg.model_name}：${gb(dl.done)}/${gb(dl.total)}GB${speed}`;
+  $('dlBar').value = dl.total ? dl.done / dl.total : 0;
+  const top = document.querySelector('.topbar').getBoundingClientRect().bottom + 8;
+  const toast = $('toast');
+  box.style.top = `${toast.classList.contains('hidden') ? top : toast.getBoundingClientRect().bottom + 8}px`;
+}
+
+// 设置 → 识别 → 模型: the choices come from the backend, which loads nothing else.
+function showAsrModels(msg) {
+  if (!Array.isArray(msg.models) || !Array.isArray(msg.compute_types)) return;
+  const before = state.asrStatus;
+  state.asrStatus = msg;
+  // Status messages also arrive twice a second during a download: leave the choices alone
+  // (one may be open) unless the lists changed, and only re-read the GPU when the model did.
+  const lists = (m) => JSON.stringify([m.models, m.default_model, m.compute_types, m.default_compute]);
+  const loaded = (m) => JSON.stringify([m.model, m.model_name, m.compute_type, m.device]);
+  if (before && lists(before) === lists(msg)) {
+    if (loaded(before) !== loaded(msg)) refreshVram();
+    else showVram();
+    return;
+  }
+  const fill = (id, key, all, def, label, defLabel = label) => {
+    const others = all.filter((v) => v !== def);
+    $(id).replaceChildren(new Option(`默认（${defLabel(def)}）`, ''), ...others.map((v) => new Option(label(v), v)));
+    // A saved choice that is now the default, or no longer offered, becomes "默认".
+    if (settings.asr[key] && !others.includes(settings.asr[key])) {
+      settings.asr[key] = '';
+      saveSettings();
+    }
+    $(id).value = settings.asr[key];
+  };
+  fill('asrModel', 'model', msg.models, msg.default_model, (m) => MODEL_LABELS[m] || m, (m) => m);
+  fill(
+    'asrCompute', 'compute', msg.compute_types, msg.default_compute,
+    (c) => COMPUTE_LABELS[c] || c,
+    (c) => (c === 'auto' ? '自动：GPU 用 float16，CPU 用 int8' : c),
+  );
+  refreshVram(); // a model was just loaded or is loading: the GPU's memory changed
+}
+
+// Rough VRAM need of a model: its weights (parameter count x bytes per weight) plus about
+// 1.5 GB for the CUDA libraries and the decoding work area. An estimate, not a measurement.
+const MODEL_PARAMS_M = { 'large-v3-turbo': 809, 'large-v3': 1550 };
+const WEIGHT_BYTES = { float16: 2, int8_float16: 1, int8: 1, float32: 4 };
+
+function estimateVramGb(model, compute, onCpu) {
+  if (onCpu) return 0;
+  const bytes = WEIGHT_BYTES[compute === 'auto' ? 'float16' : compute];
+  if (!MODEL_PARAMS_M[model] || !bytes) return null;
+  return (MODEL_PARAMS_M[model] * bytes) / 1024 + 1.5;
+}
+
+// "6.6/8GB": memory in use on the whole GPU (every program), as nvidia-smi reports it.
+function vramText(gpu) {
+  return `${(gpu.used_mb / 1024).toFixed(1)}/${Math.round(gpu.total_mb / 1024)}GB`;
+}
+
+// The line under the model choices, and the pill at the end of the status bar.
+function showVram() {
+  const st = state.asrStatus;
+  const gpu = state.gpu;
+  const hasGpu = Boolean(gpu && gpu.total_mb);
+  if (st) {
+    const model = settings.asr.model || st.default_model;
+    const compute = settings.asr.compute || st.default_compute;
+    const est = estimateVramGb(model, compute, st.model === 'ready' && st.device === 'cpu');
+    let text = `预计显存占用：${est === null ? '未知' : `${est.toFixed(1)}GB`}`;
+    if (hasGpu) text += `，目前显存占用：${vramText(gpu)}`;
+    $('asrVram').textContent = `${text}。`;
+  }
+  const pill = $('stVram');
+  if (!hasGpu) {
+    pill.classList.add('hidden');
+    return;
+  }
+  const used = gpu.used_mb / gpu.total_mb;
+  setPill(pill, `显存占用：${vramText(gpu)}`, used >= VRAM_ERR ? 'err' : used >= VRAM_WARN ? 'warn' : '');
+}
+
+// Share of the GPU's memory in use from which the pill turns yellow, then red. Near full,
+// Whisper slows down sharply (Windows starts paging VRAM to system RAM) or fails to load.
+const VRAM_WARN = 0.8;
+const VRAM_ERR = 0.9;
+const VRAM_POLL_MS = 5000;
+
+async function refreshVram() {
+  const seq = (state.vramSeq = (state.vramSeq || 0) + 1);
+  let gpu = null;
+  try {
+    gpu = await (await fetch('/api/gpu')).json();
+  } catch {
+    /* backend not reachable: no reading */
+  }
+  if (seq !== state.vramSeq) return; // a newer call is on its way
+  state.gpu = gpu;
+  showVram();
+}
+
+setInterval(() => {
+  if (!document.hidden) refreshVram();
+}, VRAM_POLL_MS);
 
 // ---------------------------------------------------------------- segments
 
@@ -1437,6 +1569,12 @@ $('asrLang').addEventListener('change', () => {
 $('asrLangOther').addEventListener('change', () => setAsrLang($('asrLangOther').value));
 showAsrLang();
 loadOtherLangs();
+const onModelChoice = () => {
+  sendConfig();
+  showVram();
+};
+bind('asrModel', 'asr.model', onModelChoice);
+bind('asrCompute', 'asr.compute', onModelChoice);
 bind('vadThr', 'asr.vadThreshold', sendConfig);
 bind('vadSil', 'asr.minSilenceMs', sendConfig);
 bind('vadMax', 'asr.maxSegmentS', sendConfig);

@@ -65,6 +65,11 @@
     <button id="toastClose" class="toast-close" title="关闭">×</button>
   </div>
 
+  <div id="dlToast" class="toast dl hidden" role="status">
+    <span id="dlText"></span>
+    <progress id="dlBar" max="1" value="0"></progress>
+  </div>
+
   <footer class="statusbar">
     <span id="stWs" class="pill">后端：未连接</span>
     <span id="stModel" class="pill">模型：-</span>
@@ -73,6 +78,7 @@
     <span id="shareLabel" class="pill share-label hidden"></span>
     <span id="stAsr" class="pill">识别：-</span>
     <span id="stTr" class="pill">翻译：-</span>
+    <span id="stVram" class="pill hidden"></span>
   </footer>
 
   <!-- 设置面板 -->
@@ -165,6 +171,17 @@
         <label class="field hidden" id="asrLangOtherField">其他语言
           <select id="asrLangOther"></select>
         </label>
+      </div>
+
+      <div class="sect">
+        <h3>模型</h3>
+        <label class="field">识别模型
+          <select id="asrModel"><option value="">默认</option></select>
+        </label>
+        <label class="field">计算精度
+          <select id="asrCompute"><option value="">默认</option></select>
+        </label>
+        <div class="row" id="asrVram"></div>
       </div>
 
       <div class="sect">
