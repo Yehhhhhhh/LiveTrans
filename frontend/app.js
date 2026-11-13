@@ -17,14 +17,14 @@ const DEFAULTS = {
     maxSegmentS: 8,
     glossaryPrompt: true,
     // Course name in the lecture's language, put before the glossary terms in the Whisper prompt.
-    hint: 'Lezione di telecomunicazioni / Telecommunications lecture',
+    hint: '',
     partial: true,
   },
   tr: {
     enabled: true,
     live: true,
     useLocal: false, // overrides provider with the local Ollama model
-    domain: '通信工程', // course domain named in the translation prompt; '' = unspecified
+    domain: '', // course domain named in the translation prompt; '' = unspecified
     local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
     provider: 'openai',
     contextSize: 3,
