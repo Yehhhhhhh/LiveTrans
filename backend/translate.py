@@ -24,8 +24,8 @@ SYSTEM_PROMPT_TEMPLATE = """你是一名专业的同声传译员，正在为<COU
 - 如果这一段只是口头语（如 "allora"、"ok"、"quindi"），给出简短的对应中文即可。
 - 上文只用于理解语境，不要重复翻译上文。"""
 
-# The course the lecture belongs to (设置 → 翻译 → 课程领域); requests without one get this.
-DEFAULT_DOMAIN = "通信工程"
+# The course the lecture belongs to (设置 → 翻译 → 课程领域); blank by default, i.e. unspecified.
+DEFAULT_DOMAIN = ""
 
 
 def system_prompt(domain: str | None = DEFAULT_DOMAIN) -> str:
