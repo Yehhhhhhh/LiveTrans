@@ -114,7 +114,7 @@ def split_prompt(prompt: str) -> tuple[set[str], set[str]]:
     """Words of the course hint and of the glossary terms in a Whisper prompt.
 
     app.js builds the prompt as "<course hint>. <term>, <term>, ..." (the hint is set in
-    设置 → 识别, default "Lezione di telecomunicazioni / Telecommunications lecture"), or just
+    设置 → 识别, blank by default), or just
     "<term>, <term>, ..." when the hint is empty, or "<course hint>. " when there are no terms:
     the hint is everything before the first ". ".
     """
@@ -234,6 +234,61 @@ def setup_cuda_dlls() -> None:
         os.environ["PATH"] = os.pathsep.join(found + [os.environ.get("PATH", "")])
 
 
+# The files of a faster-whisper model (as faster_whisper.utils.download_model fetches them).
+MODEL_FILES = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"]
+PROGRESS_INTERVAL_S = 0.5
+
+
+class _NoOutput:
+    """Where the download's progress bars print: nowhere."""
+
+    def write(self, text: str) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+
+def fetch_model(name: str, report) -> str:
+    """Download the model's files (or find them in the cache) and return their folder.
+
+    faster-whisper downloads a model by itself, but with the progress bars switched off, and a
+    3 GB download that shows nothing looks like a hang. This does the same download with bars
+    that call `report(done, total, rate)` (bytes, bytes, bytes per second or None) instead of
+    printing, at most every PROGRESS_INTERVAL_S. Nothing is reported for a model already cached.
+    """
+    import huggingface_hub
+    from faster_whisper.utils import _MODELS
+    from tqdm import tqdm
+
+    repo = name if "/" in name else _MODELS[name]
+    bars: list = []
+    last = [0.0]
+
+    class Bar(tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs["file"] = _NoOutput()
+            kwargs["disable"] = False
+            super().__init__(*args, **kwargs)
+            if self.unit == "B":
+                bars.append(self)
+
+        def update(self, n=1):
+            out = super().update(n)
+            # Two byte bars: received from the network, and written to disk (which lags behind,
+            # in bursts). The first to move shows progress; the smaller total is the real size,
+            # the other one is stretched by the library when more bytes arrive than expected.
+            totals = [b.total for b in bars if b.total]
+            now = time.monotonic()
+            if self.unit == "B" and totals and now - last[0] >= PROGRESS_INTERVAL_S:
+                last[0] = now
+                total = min(totals)
+                report(min(max(b.n for b in bars), total), total, self.format_dict.get("rate"))
+            return out
+
+    return huggingface_hub.snapshot_download(repo, allow_patterns=MODEL_FILES, tqdm_class=Bar)
+
+
 class Transcriber:
     def __init__(self) -> None:
         self.model = None
@@ -242,12 +297,56 @@ class Transcriber:
         self.device = ""
         self.compute_type = ""
         self.model_name = ""
+        # (model, compute type) the loaded model was asked for with; compute_type above is the
+        # one in use ("auto" resolved). None while nothing is loaded.
+        self.choice: tuple[str, str] | None = None
+        # (done, total, rate) of the model download in progress, in bytes (rate: per second or
+        # None); None when nothing is being downloaded. on_progress is called when it changes.
+        self.progress: tuple[int, int, float | None] | None = None
+        self.on_progress = lambda: None
 
-    def load(self, model_name: str, device: str = "auto", compute_type: str = "auto") -> None:
+    def load(
+        self,
+        model_name: str,
+        device: str = "auto",
+        compute_type: str = "auto",
+        fallback: tuple[str, str] | None = None,
+    ) -> None:
+        """Load a model. `fallback` is a (model, compute type) to load instead when that fails.
+
+        The status stays "loading" until the outcome of both is known: whatever waits for the
+        model (see server.wait_for_model) must not act on a failure that is about to be repaired.
+        """
+        self.status = "loading"
+        error = self._load(model_name, device, compute_type)
+        if error and fallback and fallback != (model_name, compute_type):
+            first = error
+            error = self._load(fallback[0], device, fallback[1])
+            if error:
+                error = f"{first}; {error}"
+            else:
+                self.error = f"{model_name}（{compute_type}）加载失败，已换回 {fallback[0]}（{fallback[1]}）。{first}"
+        if error:
+            self.model, self.choice = None, None
+            self.error = "模型加载失败：" + error
+            self.status = "error"
+        else:
+            self.status = "ready"
+
+    def _load(self, model_name: str, device: str, compute_type: str) -> str:
+        """Try to load a model: "" when it is loaded, else what went wrong."""
         from faster_whisper import WhisperModel
 
-        self.status = "loading"
         self.model_name = model_name
+        path = model_name
+        if not os.path.isdir(model_name):
+            try:
+                path = fetch_model(model_name, self._report)
+            except Exception:  # noqa: BLE001 - let faster-whisper try, and report its error
+                log.exception("Downloading %s with progress failed", model_name)
+            finally:
+                self.progress = None
+                self.on_progress()
         attempts = []
         if device in ("auto", "cuda"):
             attempts.append(("cuda", "float16" if compute_type == "auto" else compute_type))
@@ -257,19 +356,22 @@ class Transcriber:
         for dev, ct in attempts:
             try:
                 t0 = time.time()
-                model = WhisperModel(model_name, device=dev, compute_type=ct)
+                model = WhisperModel(path, device=dev, compute_type=ct)
                 # Warm up so the first real segment doesn't pay CUDA init / kernel load.
                 list(model.transcribe(np.zeros(16000, dtype=np.float32), language="en", beam_size=1)[0])
                 self.model, self.device, self.compute_type = model, dev, ct
-                self.status = "ready"
+                self.choice = (model_name, compute_type)
                 self.error = "" if dev == "cuda" or device == "cpu" else "未能使用 GPU，已回退到 CPU：" + "; ".join(errors)
                 log.info("Loaded %s on %s/%s in %.1fs", model_name, dev, ct, time.time() - t0)
-                return
+                return ""
             except Exception as e:  # noqa: BLE001 - report any backend failure and try the next one
                 log.exception("Failed to load %s on %s/%s", model_name, dev, ct)
                 errors.append(f"{dev}: {e}")
-        self.status = "error"
-        self.error = "模型加载失败：" + "; ".join(errors)
+        return "; ".join(errors)
+
+    def _report(self, done: int, total: int, rate: float | None) -> None:
+        self.progress = (int(done), int(total), rate)
+        self.on_progress()
 
     def pick_language(self, audio: np.ndarray, among: tuple[str, ...] | None = LANGS) -> tuple[str, float]:
         """Most likely language of the audio, restricted to `among` (None = any), and its

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 import wave
@@ -41,6 +43,12 @@ PORT = int(os.environ.get("LIVETRANS_PORT", "8765"))
 MODEL = os.environ.get("LIVETRANS_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("LIVETRANS_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
+# Whisper models the page may choose in 设置 → 识别. Only these names are ever loaded: the name comes
+# from the page, and a free one could point faster-whisper at any repository or local path.
+ASR_MODELS = tuple(dict.fromkeys((MODEL, "large-v3-turbo", "large-v3")))
+# Compute types (weight precision) it may choose. "auto" is float16 on a GPU and int8 on the CPU;
+# the int8 ones roughly halve the VRAM the weights take, at a small cost in accuracy.
+COMPUTE_TYPES = tuple(dict.fromkeys((COMPUTE_TYPE, "auto", "float16", "int8_float16", "int8")))
 # Set LIVETRANS_RECORD=1 to save each capture's raw 16 kHz audio to recordings/ (for tuning).
 RECORD = os.environ.get("LIVETRANS_RECORD", "") == "1"
 # Host names (besides localhost and IP addresses) the page may be opened under, comma-separated,
@@ -76,11 +84,25 @@ clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
 
+def download_progress() -> dict | None:
+    """The model download in progress, for the page's progress bar; None when there is none."""
+    progress = getattr(transcriber, "progress", None)
+    if not progress or transcriber.status != "loading":
+        return None
+    done, total, rate = progress
+    return {"done": done, "total": total, "rate": round(rate) if rate else None}
+
+
 def status_message() -> dict:
     return {
         "type": "status",
         "model": transcriber.status,
         "model_name": transcriber.model_name or MODEL,
+        "models": list(ASR_MODELS),
+        "default_model": MODEL,
+        "compute_types": list(COMPUTE_TYPES),
+        "default_compute": COMPUTE_TYPE,
+        "download": download_progress(),
         "device": transcriber.device,
         "compute_type": transcriber.compute_type,
         "error": transcriber.error,
@@ -96,20 +118,92 @@ async def broadcast_status() -> None:
             clients.discard(ws)
 
 
+DEFAULT_CHOICE = (MODEL, COMPUTE_TYPE)
+# The (model, compute type) the page asked for (设置 → 识别 → 模型). It can differ from the loaded
+# one while a load is running: the choice is kept and applied when that load ends (ensure_model).
+wanted_choice = [DEFAULT_CHOICE]
+# The choice that last failed to load. It is not tried again until the page asks for another
+# one: the page resends its settings often, and each try would stall recognition for a while.
+failed_choice: list[tuple[str, str] | None] = [None]
+switch_tasks: set[asyncio.Task] = set()
+
+
 def load_model_in_background() -> None:
     def run() -> None:
         transcriber.load(MODEL, DEVICE, COMPUTE_TYPE)
         if loop:
-            asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
+            asyncio.run_coroutine_threadsafe(after_model_load(DEFAULT_CHOICE), loop)
 
     transcriber.status = "loading"
     threading.Thread(target=run, daemon=True).start()
+
+
+def request_model(model: object, compute: object) -> None:
+    """The page chose a model and/or a compute type; "" is the server's default (LIVETRANS_MODEL,
+    LIVETRANS_COMPUTE_TYPE), None leaves that one as it is. Names not on the lists are ignored."""
+    new_model, new_compute = wanted_choice[0]
+    if isinstance(model, str) and (model or MODEL) in ASR_MODELS:
+        new_model = model or MODEL
+    if isinstance(compute, str) and (compute or COMPUTE_TYPE) in COMPUTE_TYPES:
+        new_compute = compute or COMPUTE_TYPE
+    wanted_choice[0] = (new_model, new_compute)
+    ensure_model()
+
+
+def ensure_model() -> None:
+    """Start loading the wanted choice unless it is loaded, just failed, or a load is running."""
+    want = wanted_choice[0]
+    if transcriber.status in ("idle", "loading") or want in (transcriber.choice, failed_choice[0]):
+        return
+    transcriber.status = "loading"  # from here on finals wait (wait_for_model) and partials stop
+    t = asyncio.create_task(switch_model(want))
+    switch_tasks.add(t)
+    t.add_done_callback(switch_tasks.discard)
+
+
+def reload_model(choice: tuple[str, str]) -> None:
+    """Replace the loaded model; if the new one fails, go back to the one that was loaded."""
+    previous = transcriber.choice if transcriber.model is not None else None
+    # Free the old model first: two large models don't fit in the VRAM of an 8 GB card.
+    transcriber.model = None
+    gc.collect()
+    transcriber.load(choice[0], DEVICE, choice[1], fallback=previous)
+
+
+async def switch_model(choice: tuple[str, str]) -> None:
+    await broadcast_status()
+    # Under gpu_lock: a transcription that is running finishes on the old model first.
+    async with gpu_lock:
+        await to_thread_to_end(reload_model, choice)
+    await after_model_load(choice)
+
+
+async def after_model_load(choice: tuple[str, str]) -> None:
+    failed_choice[0] = None if transcriber.choice == choice else choice
+    await broadcast_status()
+    ensure_model()  # the page may have chosen something else meanwhile
+
+
+def gpu_memory() -> tuple[int, int] | None:
+    """(used, total) MiB of the first NVIDIA GPU as nvidia-smi reports it; None without one."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        used, total = (int(x) for x in out.splitlines()[0].split(","))
+        return used, total
+    except Exception:  # noqa: BLE001 - no NVIDIA GPU / driver, or output we can't read
+        return None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global translator, vad_model, loop
     loop = asyncio.get_running_loop()
+    # Called from the thread that loads the model, as its download advances.
+    transcriber.on_progress = lambda: asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
     vad_model = SileroModel()
     translator = Translator()
     load_model_in_background()
@@ -121,6 +215,13 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan)
 # Other websites open in the browser must not reach /ws or the API (see guard.py).
 app.add_middleware(LocalOnlyMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+
+@app.get("/api/gpu")
+def api_gpu() -> dict:
+    """VRAM in use on the whole GPU (all programs), for 设置 → 识别 → 模型. Empty without one."""
+    mem = gpu_memory()
+    return {"used_mb": mem[0], "total_mb": mem[1]} if mem else {}
 
 
 @app.get("/api/languages")
@@ -165,12 +266,13 @@ async def api_translate(req: TranslateRequest) -> dict:
 
 class WarmupRequest(BaseModel):
     config: dict
+    reload: bool = False  # unload the model first (see Translator.warmup)
 
 
 @app.post("/api/translate/warmup")
 async def api_translate_warmup(req: WarmupRequest) -> dict:
     try:
-        await translator.warmup(req.config)
+        await translator.warmup(req.config, req.reload)
     except TranslateError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"ok": True}
@@ -559,6 +661,8 @@ async def ws_audio(ws: WebSocket) -> None:
                         opts["partial"] = bool(asr["partial"])
                     if "context" in asr:
                         opts["context"] = bool(asr["context"])
+                    if "model" in asr or "compute" in asr:
+                        request_model(asr.get("model"), asr.get("compute"))
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
