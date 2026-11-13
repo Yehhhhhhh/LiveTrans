@@ -4,9 +4,9 @@ from translate import DEFAULT_DOMAIN, system_prompt
 DEFAULT_HINT_PROMPT = "Lezione di telecomunicazioni / Telecommunications lecture. OFDM, modulazione, Doppler."
 
 
-def test_default_domain_is_telecommunications():
-    assert DEFAULT_DOMAIN == "通信工程"
-    assert "正在为一门「通信工程」大学课程做实时字幕翻译" in system_prompt()
+def test_default_domain_is_blank():
+    assert DEFAULT_DOMAIN == ""
+    assert "正在为一门大学课程做实时字幕翻译" in system_prompt()
 
 
 def test_custom_domain():
