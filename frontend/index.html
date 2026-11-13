@@ -137,7 +137,8 @@
         <label class="row"><input type="checkbox" id="trLocal"> 使用本地模型（Ollama，开启后忽略云端服务）</label>
         <label class="field">Ollama 地址 <input id="locBase" placeholder="http://127.0.0.1:11434"></label>
         <label class="field">本地模型 <input id="locModel" placeholder="qwen3:4b-instruct-2507-q4_K_M"></label>
-        <p class="hint">需先安装 Ollama 并执行 ollama pull 下载模型。</p>
+        <label class="row"><input type="checkbox" id="locCpu"> 在 CPU 上运行（不占显卡）</label>
+        <p class="hint">需先安装 Ollama 并执行 ollama pull 下载模型。在显卡上运行时，翻译和识别互相抢显卡，识别会变慢；在 CPU 上运行时翻译本身较慢，建议同时关闭「提前翻译」。</p>
       </div>
 
       <div class="sect">

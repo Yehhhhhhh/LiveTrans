@@ -25,7 +25,8 @@ const DEFAULTS = {
     live: true,
     useLocal: false, // overrides provider with the local Ollama model
     domain: '', // course domain named in the translation prompt; '' = unspecified
-    local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M' },
+    // cpu: run the model on the CPU, so it doesn't share the GPU with Whisper.
+    local: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen3:4b-instruct-2507-q4_K_M', cpu: false },
     provider: 'openai',
     contextSize: 3,
     openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: '' },
@@ -1334,13 +1335,14 @@ function bindToggle(ids, path, onChange) {
   ids.forEach((id) => bind(id, path, sync));
 }
 
-async function warmupLocal() {
+// reload: unload the model first, so that it moves between the GPU and the CPU.
+async function warmupLocal(reload = false) {
   setPill($('stTr'), '翻译：正在加载本地模型…', 'warn');
   try {
     const res = await fetch('/api/translate/warmup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config: settings.tr.local }),
+      body: JSON.stringify({ config: settings.tr.local, reload }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
@@ -1355,8 +1357,13 @@ async function warmupLocal() {
 }
 
 bindToggle(['trLive', 'tbLive'], 'tr.live');
+bind('locCpu', 'tr.local.cpu', () => {
+  if (settings.tr.useLocal) warmupLocal(true);
+});
 bindToggle(['trLocal', 'tbLocal'], 'tr.useLocal', (on) => {
-  if (on) return warmupLocal();
+  // Reloaded: the CPU setting may have been changed while the local model was off, and the
+  // model may still be loaded where the old setting put it.
+  if (on) return warmupLocal(true);
   clearTrMsg();
   setPill($('stTr'), '翻译：-');
 });

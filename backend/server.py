@@ -165,12 +165,13 @@ async def api_translate(req: TranslateRequest) -> dict:
 
 class WarmupRequest(BaseModel):
     config: dict
+    reload: bool = False  # unload the model first (see Translator.warmup)
 
 
 @app.post("/api/translate/warmup")
 async def api_translate_warmup(req: WarmupRequest) -> dict:
     try:
-        await translator.warmup(req.config)
+        await translator.warmup(req.config, req.reload)
     except TranslateError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"ok": True}
