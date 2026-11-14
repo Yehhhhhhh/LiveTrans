@@ -1,12 +1,13 @@
 # LiveTrans 同传字幕
 
-课堂实时字幕：意大利语 / 英语混合语音 → 本地 Whisper 识别 → 云端 API 或本地 Ollama 模型翻译成中文，在 Chrome 中显示。
+课堂实时字幕：意大利语 / 英语混合语音 → 本地 Whisper（或云端 AssemblyAI）识别 → 云端 API 或本地 Ollama 模型翻译成中文，在 Chrome 中显示。
 
 ## 特性
 
 - 本地 GPU 运行 faster-whisper（`large-v3-turbo`），默认在意大利语 / 英语间逐段自动识别，也可自动识别所有语言或固定为任一种语言
 - Silero VAD 流式断句，说话时逐词实时显示，句末替换为精确结果；老师声音小、离得远也能检测到
 - 自动过滤 Whisper 幻觉（重复循环、「Grazie a tutti」之类的套话、复读术语表提示）
+- 识别也可以改用云端的 AssemblyAI 流式识别（不占显卡，按时长计费），见「识别引擎」
 - 翻译支持 OpenAI 兼容接口、Claude，以及本机 Ollama 本地模型（不经过云端），带上下文与术语表，流式输出
 - 译文中的数学公式用 KaTeX 渲染（离线可用）
 - 音源支持麦克风、系统音频、某个窗口或标签页，无需虚拟声卡；识别中可随时换窗口 / 换音源，不中断
@@ -100,6 +101,30 @@
 - 本地 4B 模型翻译质量不如云端大模型，专业术语主要靠术语表纠正。
 - 常见错误：「无法连接 Ollama」→ 确认 Ollama 已启动；「本地没有模型 …」→ 先执行上面的 `ollama pull`。翻译恢复正常或改用 API 后，错误提示会自动消失。
 
+## 识别引擎（设置 → 识别）
+
+默认用本机的 Whisper。也可以换成 **AssemblyAI**（云端流式识别）：不占显卡，没有 NVIDIA 显卡也能用，但音频会上传到 AssemblyAI，并按采集时长计费。
+
+1. 在 [AssemblyAI](https://www.assemblyai.com/) 注册并取得 API Key。
+2. 「设置 → 识别 → 识别引擎」选「AssemblyAI」，填入 API Key（和翻译的 Key 一样只保存在本机浏览器里，由本机后端直接连接 AssemblyAI）。
+3. 选择模型，然后点「开始」。状态栏显示「模型：AssemblyAI · …」（绿色）即已连接。
+
+| 模型 | 语言 | 价格（2026-11） |
+|---|---|---|
+| Universal-Streaming English（默认） | 只识别英语 | $0.15 / 小时 |
+| Universal-Streaming Multilingual | 英 / 西 / 德 / 法 / 葡 / 意，每句判断一次语种 | $0.15 / 小时 |
+| Universal-3.6 Pro | 32 种语言，一句话里混用两种语言也能识别 | $0.45 / 小时 |
+
+说明：
+
+- **默认模型只识别英语**，意大利语会被当成英语写出来。意大利语或意 / 英混合的课请换成后两个模型。
+- 「识别语言」只对 Universal-3.6 Pro 起作用（意大利语 / 英语、固定某种语言时告诉它偏向这些语言）；Multilingual 模型自己判断语种，English 模型固定为英语。
+- 断句由 AssemblyAI 完成。「识别模型」「计算精度」「断句」「用上一句作为上下文」只用于本地 Whisper，选 AssemblyAI 时不显示；「识别提示语」不会发送。
+- 「用术语表提示识别」仍然有效：术语作为关键词发给 AssemblyAI（最多 100 条，每条不超过 50 个字符）。
+- 「说话时逐词实时显示」、提前翻译、断线续传照常工作。和 AssemblyAI 的连接中断时会自动重连并补发还没出结果的音频；Key 无效或余额不足时不重试，页面上方会提示。
+- 引擎、Key、模型的改动在下一次「开始」生效。按时长计费从「开始」算到「停止」，不用时请停止。
+- 选了 AssemblyAI 后，后端启动时仍会加载本地 Whisper 模型（占用显存），目前不能关闭。
+
 ## 识别参数（设置 → 识别）
 
 - **识别语言**：
@@ -179,6 +204,7 @@ backend/tools/         freeze_lock.py：由当前环境生成 requirements.lock
 backend/server.py      FastAPI：/ws 音频流、/api/translate 翻译代理、/api/window 窗口信息、静态页面
 backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（识别语言模式）、幻觉过滤
+backend/assembly.py    AssemblyAI 流式识别（云端识别引擎）
 backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
 backend/winfo.py       由窗口句柄查程序名、窗口标题和图标（Windows API）
 backend/tests/         pytest 单元测试（依赖见 requirements-dev.txt）

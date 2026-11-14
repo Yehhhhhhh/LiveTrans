@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from starlette.websockets import WebSocketState  # noqa: E402
 
+import assembly  # noqa: E402
 from asr import Transcriber  # noqa: E402
 from guard import LocalOnlyMiddleware  # noqa: E402
 from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
@@ -408,7 +409,16 @@ async def ws_audio(ws: WebSocket) -> None:
     await ws.send_json(status_message())
 
     seg = Segmenter(vad_model, SegmenterParams())
-    opts = {"language": IT_EN, "prompt": "", "partial": True, "context": True}
+    opts = {
+        "language": IT_EN, "prompt": "", "partial": True, "context": True,
+        # Recognition engine: "local" (Whisper) or "assemblyai" (see assembly.py), with its API
+        # key and model. Applied by the next "start" / "resume".
+        "engine": "local", "key": "", "ai_model": assembly.DEFAULT_MODEL,
+    }
+    # run -> its AssemblyAI stream, for runs captured with that engine. `cloud`: the current run
+    # is one of them, so its audio goes to the stream and not through the VAD to Whisper.
+    streams: dict[int, assembly.AssemblyStream] = {}
+    cloud = [False]
     # What the last answered segment said, in which language, and when (seconds, on the same clock
     # as a result's "start") it ended. Used as context for the next segment of the same run.
     ctx = {"text": "", "lang": "", "run": 0, "end": 0.0}
@@ -432,6 +442,8 @@ async def ws_audio(ws: WebSocket) -> None:
     unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
 
     def committed() -> int:
+        if run[0] in streams:
+            return bases.get(run[0], 0) + streams[run[0]].committed
         pos = seg.committed_frames() * FRAME
         mine = [p for (r, _), p in unsent.items() if r == run[0]]
         if mine:
@@ -441,8 +453,53 @@ async def ws_audio(ws: WebSocket) -> None:
     async def send_run_done(r: int) -> None:
         # An ended run (开始 pressed again, or the next run resumed) whose segments are all
         # answered: the page can drop the audio it kept for it.
-        if r != run[0] and not any(k[0] == r for k in unsent):
-            await ws.send_json({"type": "run_done", "run": r})
+        if r == run[0] or any(k[0] == r for k in unsent):
+            return
+        if r in streams and not streams[r].done:
+            return  # its last turn is still coming (see on_stream, "closed")
+        streams.pop(r, None)
+        await ws.send_json({"type": "run_done", "run": r})
+
+    def stream_commit(s: assembly.AssemblyStream) -> dict:
+        return {"committed": bases.get(s.run, 0) + s.committed, "committed_run": s.run}
+
+    async def on_stream(s: assembly.AssemblyStream, ev: dict) -> None:
+        """An AssemblyAI stream's events, as the messages the page knows from the Whisper path."""
+        current = s.run == run[0]  # an older run's indices mean nothing for the current one
+        kind = ev["kind"]
+        if kind == "partial":
+            if opts["partial"] and current and ev["index"] > live["final_sent"]:
+                await ws.send_json({"type": "partial", "index": ev["index"], "text": ev["text"]})
+        elif kind == "drop":
+            if current:
+                await ws.send_json({"type": "partial_drop", "index": ev["index"]})
+        elif kind == "final":
+            if current:
+                live["final_sent"] = max(live["final_sent"], ev["index"])
+            log.info("[%s %.2fs %s] %s", ev["lang"], ev["duration"], s.model, ev["text"])
+            await ws.send_json({
+                "type": "segment",
+                "index": ev["index"],
+                "start": round(bases.get(s.run, 0) / 16000 + ev["start"], 3),
+                "duration": round(ev["duration"], 2),
+                "lang": ev["lang"],
+                "lang_prob": ev["lang_prob"],
+                "text": ev["text"],
+                "asr_ms": 0,
+                "merged": 1,
+                "run": s.run,
+                **stream_commit(s),
+            })
+        elif kind == "state":
+            await ws.send_json({"type": "engine", "state": ev["state"], "model": s.model, "run": s.run})
+            if ev["state"] == "error":
+                await ws.send_json({"type": "error", "message": ev["message"]})
+        elif kind == "closed":
+            # Everything is answered now: the page can drop the audio it kept for this run.
+            await ws.send_json(
+                {"type": "engine", "state": "closed", "model": s.model, "run": s.run, **stream_commit(s)}
+            )
+            await send_run_done(s.run)
 
     def commit_info() -> dict:
         # The run the position belongs to: a message sent before a "start" was processed may reach
@@ -622,14 +679,20 @@ async def ws_audio(ws: WebSocket) -> None:
                         rec[0] = open_recording()
                     rec[0].writeframes(msg["bytes"])
                 new = seg.feed(msg["bytes"])
-                for s in new:
-                    s.run = run[0]
-                    unsent[(s.run, s.index)] = round(s.start * 16000)
-                    queue.put_nowait(s)
-                if new:
-                    await send_backlog()
-                for index in seg.take_dropped():
-                    await ws.send_json({"type": "partial_drop", "index": index})
+                if cloud[0]:
+                    # AssemblyAI finds the sentences itself; the VAD only feeds the status bar.
+                    seg.take_dropped()
+                    if run[0] in streams:
+                        streams[run[0]].feed(msg["bytes"])
+                else:
+                    for s in new:
+                        s.run = run[0]
+                        unsent[(s.run, s.index)] = round(s.start * 16000)
+                        queue.put_nowait(s)
+                    if new:
+                        await send_backlog()
+                    for index in seg.take_dropped():
+                        await ws.send_json({"type": "partial_drop", "index": index})
                 now = time.monotonic()
                 if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
                     speaking = seg.speaking
@@ -640,7 +703,8 @@ async def ws_audio(ws: WebSocket) -> None:
                         "prob": round(seg.take_peak_prob(), 2),
                         **commit_info(),
                     })
-                maybe_partial()
+                if not cloud[0]:
+                    maybe_partial()
             elif msg.get("text"):
                 data = json.loads(msg["text"])
                 kind = data.get("type")
@@ -664,6 +728,13 @@ async def ws_audio(ws: WebSocket) -> None:
                     if "model" in asr or "compute" in asr:
                         request_model(asr.get("model"), asr.get("compute"))
                     opts["prompt"] = (data.get("prompt") or "")[:1000]
+                    if asr.get("engine") in ("local", "assemblyai"):
+                        opts["engine"] = asr["engine"]
+                    if isinstance(asr.get("assemblyai_key"), str):
+                        opts["key"] = asr["assemblyai_key"].strip()
+                    opts["ai_model"] = assembly.normalize_model(asr.get("assemblyai_model")) or opts["ai_model"]
+                    if run[0] in streams:  # language or glossary changed while capturing
+                        streams[run[0]].update(opts["language"], assembly.keyterms(opts["prompt"]))
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
                     # the audio from there; segment start times continue from that position.
@@ -674,11 +745,29 @@ async def ws_audio(ws: WebSocket) -> None:
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                     ctx.update(text="", lang="")
                     bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
+                    if old != run[0] and old in streams:
+                        streams[old].close()  # normally closed already, by "stop"
+                    if run[0] in streams:
+                        streams.pop(run[0]).abort()
+                    cloud[0] = opts["engine"] == "assemblyai"
+                    if cloud[0]:
+                        stream = assembly.AssemblyStream(
+                            opts["key"], opts["ai_model"], opts["language"],
+                            assembly.keyterms(opts["prompt"]), on_stream,
+                        )
+                        stream.run = run[0]
+                        streams[run[0]] = stream
+                        stream.start()
                     if old and old != run[0]:  # 0: no run yet on this connection
                         await send_run_done(old)
                 elif kind == "stop":
                     close_recording()
                     new = seg.flush()
+                    if cloud[0]:
+                        new = []
+                        seg.take_dropped()
+                        if run[0] in streams:
+                            streams[run[0]].close()
                     for s in new:
                         s.run = run[0]
                         unsent[(s.run, s.index)] = round(s.start * 16000)
@@ -697,6 +786,8 @@ async def ws_audio(ws: WebSocket) -> None:
         task.cancel()
         for t in partial_tasks:
             t.cancel()
+        for stream in streams.values():
+            stream.abort()
 
 
 class NoCacheStaticFiles(StaticFiles):

@@ -10,6 +10,11 @@ const DEFAULTS = {
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
   asr: {
+    // Recognition engine: 'local' (Whisper on this PC) or 'assemblyai' (cloud, streaming), with
+    // its API key and model ('' is the backend's default, Universal-Streaming English).
+    engine: 'local',
+    assemblyKey: '',
+    assemblyModel: '',
     language: 'it_en',
     lastOther: 'fr',
     // Whisper model and compute type (weight precision), from those the backend offers;
@@ -243,6 +248,9 @@ function asrConfig() {
   return {
     type: 'config',
     asr: {
+      engine: settings.asr.engine,
+      assemblyai_key: settings.asr.assemblyKey,
+      assemblyai_model: settings.asr.assemblyModel,
       language: settings.asr.language,
       model: settings.asr.model,
       compute: settings.asr.compute,
@@ -399,6 +407,12 @@ function connectWs() {
       asrStat.pending = msg.pending;
       if (!msg.pending) asrStat.merged = 1; // caught up: the merge note no longer applies
       showAsr();
+    } else if (msg.type === 'engine') {
+      // The AssemblyAI stream of a run: connecting / ready / error / closed.
+      if (msg.run === state.run) {
+        engineState = msg.state === 'closed' ? '' : msg.state;
+        showModel();
+      }
     } else if (msg.type === 'error') showMsg(msg.message);
   };
 }
@@ -414,14 +428,37 @@ function startRun() {
   wsSend({ type: 'start', run: state.run });
 }
 
-function onStatus(msg) {
+const ASSEMBLY_LABELS = {
+  '': 'Universal-Streaming English',
+  'universal-streaming-multilingual': 'Universal-Streaming Multilingual',
+  'universal-3-6-pro': 'Universal-3.6 Pro',
+};
+let whisperStatus = null; // the backend's last 'status' message
+let engineState = ''; // of the current run's AssemblyAI stream: connecting | ready | error | ''
+
+// The status bar's model pill: the Whisper model, or AssemblyAI when that engine is chosen.
+function showModel() {
   const el = $('stModel');
+  if (settings.asr.engine === 'assemblyai') {
+    const name = ASSEMBLY_LABELS[settings.asr.assemblyModel] || settings.asr.assemblyModel;
+    if (engineState === 'connecting') setPill(el, '模型：AssemblyAI 连接中…', 'warn');
+    else if (engineState === 'error') setPill(el, '模型：AssemblyAI 连接失败', 'err');
+    else setPill(el, `模型：AssemblyAI · ${name}`, engineState === 'ready' ? 'ok' : '');
+    return;
+  }
+  const msg = whisperStatus;
+  if (!msg) return;
   if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
   else if (msg.model === 'loading') {
     const dl = msg.download;
     setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
   }
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+}
+
+function onStatus(msg) {
+  whisperStatus = msg;
+  showModel();
   showDownload(msg);
   if (msg.error) showMsg(msg.error);
   showAsrModels(msg);
@@ -1576,6 +1613,25 @@ const onModelChoice = () => {
   sendConfig();
   showVram();
 };
+// Settings that only the local Whisper engine uses are hidden while AssemblyAI is chosen.
+function showEngineFields() {
+  const cloud = settings.asr.engine === 'assemblyai';
+  $('assemblyFields').classList.toggle('hidden', !cloud);
+  document.querySelectorAll('.whisperOnly').forEach((el) => el.classList.toggle('hidden', cloud));
+}
+const onEngineChoice = () => {
+  showEngineFields();
+  // The pill shows the state of the running capture's engine, which stays as it is until 开始.
+  if (state.running) showMsg('识别引擎的改动在下一次「开始」生效');
+  else engineState = '';
+  showModel();
+  sendConfig();
+};
+bind('asrEngine', 'asr.engine', onEngineChoice);
+bind('aaiKey', 'asr.assemblyKey', sendConfig);
+bind('aaiModel', 'asr.assemblyModel', onEngineChoice);
+showEngineFields();
+showModel();
 bind('asrModel', 'asr.model', onModelChoice);
 bind('asrCompute', 'asr.compute', onModelChoice);
 bind('vadThr', 'asr.vadThreshold', sendConfig);
