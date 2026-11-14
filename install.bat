@@ -29,5 +29,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo [LiveTrans] Done. Run start.bat to launch (first launch downloads the ~1.6GB Whisper model).
+echo [LiveTrans] Done. Run start.bat to launch (choosing the local Whisper engine downloads its ~1.6GB model once).
 pause

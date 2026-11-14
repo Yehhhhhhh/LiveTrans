@@ -1,13 +1,13 @@
 # LiveTrans 同传字幕
 
-课堂实时字幕：意大利语 / 英语混合语音 → 本地 Whisper（或云端 AssemblyAI）识别 → 云端 API 或本地 Ollama 模型翻译成中文，在 Chrome 中显示。
+课堂实时字幕：意大利语 / 英语混合语音 → 云端 AssemblyAI（或本地 Whisper）识别 → 云端 API 或本地 Ollama 模型翻译成中文，在 Chrome 中显示。
 
 ## 特性
 
-- 本地 GPU 运行 faster-whisper（`large-v3-turbo`），默认在意大利语 / 英语间逐段自动识别，也可自动识别所有语言或固定为任一种语言
+- 识别默认用云端的 AssemblyAI 流式识别（不占显卡，按时长计费），也可以改用本地 Whisper，见「识别引擎」
+- 本地 Whisper：GPU 运行 faster-whisper（`large-v3-turbo`），默认在意大利语 / 英语间逐段自动识别，也可自动识别所有语言或固定为任一种语言
 - Silero VAD 流式断句，说话时逐词实时显示，句末替换为精确结果；老师声音小、离得远也能检测到
 - 自动过滤 Whisper 幻觉（重复循环、「Grazie a tutti」之类的套话、复读术语表提示）
-- 识别也可以改用云端的 AssemblyAI 流式识别（不占显卡，按时长计费），见「识别引擎」
 - 翻译支持 OpenAI 兼容接口、Claude，以及本机 Ollama 本地模型（不经过云端），带上下文与术语表，流式输出
 - 译文中的数学公式用 KaTeX 渲染（离线可用）
 - 音源支持麦克风、系统音频、某个窗口或标签页，无需虚拟声卡；识别中可随时换窗口 / 换音源，不中断
@@ -19,7 +19,7 @@
 
 - Windows 10 / 11
 - Python 3.12
-- NVIDIA 显卡 + 驱动（无显卡可用 CPU，但很慢）
+- 用本地 Whisper 识别时：NVIDIA 显卡 + 驱动（无显卡可用 CPU，但很慢）；用 AssemblyAI 识别不需要显卡
 - Chrome / Edge 浏览器
 - 翻译二选一：云端 API（OpenAI 兼容接口或 Claude），或本机安装 [Ollama](https://ollama.com/download) 使用本地模型
 
@@ -27,9 +27,10 @@
 
 1. 双击 `install.bat`：创建 `.venv` 并安装依赖（含 CUDA/cuDNN 运行库，不需要单独装 CUDA，只需 NVIDIA 显卡驱动）。安装的是 `backend/requirements.lock` 中锁定的、测试过的版本，过一段时间重新安装也不会装到不兼容的新版本；锁定版本装不上时（例如 Python 版本不同）会自动改用 `requirements.txt` 中的版本范围。
 2. 双击 `start.bat`：启动后端，等后端就绪后自动打开 http://127.0.0.1:8765 。
-   首次启动会下载 Whisper `large-v3-turbo` 模型（约 1.6GB），状态栏显示「模型：large-v3-turbo · cuda/float16」即就绪。
+3. 在「设置 → 识别 → 识别引擎」中填写 AssemblyAI 的 API Key，或把引擎改为「本地 Whisper」（见「识别引擎」）。
+   选了本地 Whisper 后才会加载模型，第一次会下载 `large-v3-turbo`（约 1.6GB），状态栏显示「模型：large-v3-turbo · cuda/float16」即就绪。
    下载困难时，编辑 `start.bat`，取消 `HF_ENDPOINT` 那行的注释使用镜像。
-3. 在「设置 → 翻译」中填写 API，或开启「本地模型」（见下文），点「测试翻译」确认可用。
+4. 在「设置 → 翻译」中填写 API，或开启「本地模型」（见下文），点「测试翻译」确认可用。
 
 更新代码后（`git pull`）需要关掉 `start.bat` 窗口重新启动，后端的改动才会生效；只改了页面的话刷新浏览器即可。如果 `backend/requirements.lock` 有变化，先重新运行一次 `install.bat`。
 
@@ -103,10 +104,16 @@
 
 ## 识别引擎（设置 → 识别）
 
-默认用本机的 Whisper。也可以换成 **AssemblyAI**（云端流式识别）：不占显卡，没有 NVIDIA 显卡也能用，但音频会上传到 AssemblyAI，并按采集时长计费。
+默认用 **AssemblyAI**（云端流式识别）：不占显卡，没有 NVIDIA 显卡也能用，但音频会上传到 AssemblyAI，并按采集时长计费。也可以换成本机的 **Whisper**：音频不出本机、不收费，需要显卡。
+
+- 后端启动时不加载 Whisper 模型（不下载、不占显存）。在「识别引擎」里选了「本地 Whisper」后才开始加载，状态栏先显示「模型：加载中…」，就绪后即可识别；之前保存过这个选择的话，打开页面时就会加载。
+- 模型加载后，再换回 AssemblyAI 不会卸载它；要释放显存请重启后端（关掉 `start.bat` 窗口重新运行）。
+- 没填 API Key 时点「开始」会提示先填写 Key 或改用本地 Whisper。
+
+使用 AssemblyAI：
 
 1. 在 [AssemblyAI](https://www.assemblyai.com/) 注册并取得 API Key。
-2. 「设置 → 识别 → 识别引擎」选「AssemblyAI」，填入 API Key（和翻译的 Key 一样只保存在本机浏览器里，由本机后端直接连接 AssemblyAI）。
+2. 「设置 → 识别 → 识别引擎」选「AssemblyAI」（默认），填入 API Key（和翻译的 Key 一样只保存在本机浏览器里，由本机后端直接连接 AssemblyAI）。
 3. 选择模型，然后点「开始」。状态栏显示「模型：AssemblyAI · …」（绿色）即已连接。
 
 | 模型 | 语言 | 价格（2026-11） |
@@ -123,8 +130,6 @@
 - 「用术语表提示识别」仍然有效：术语作为关键词发给 AssemblyAI（最多 100 条，每条不超过 50 个字符）。
 - 「说话时逐词实时显示」、提前翻译、断线续传照常工作。和 AssemblyAI 的连接中断时会自动重连并补发还没出结果的音频；Key 无效或余额不足时不重试，页面上方会提示。
 - 引擎、Key、模型的改动在下一次「开始」生效。按时长计费从「开始」算到「停止」，不用时请停止。
-- 选了 AssemblyAI 后，后端启动时仍会加载本地 Whisper 模型（占用显存），目前不能关闭。
-
 ## 识别参数（设置 → 识别）
 
 - **识别语言**：

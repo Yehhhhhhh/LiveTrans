@@ -130,13 +130,26 @@ switch_tasks: set[asyncio.Task] = set()
 
 
 def load_model_in_background() -> None:
+    choice = wanted_choice[0]
+
     def run() -> None:
-        transcriber.load(MODEL, DEVICE, COMPUTE_TYPE)
+        transcriber.load(choice[0], DEVICE, choice[1])
         if loop:
-            asyncio.run_coroutine_threadsafe(after_model_load(DEFAULT_CHOICE), loop)
+            asyncio.run_coroutine_threadsafe(after_model_load(choice), loop)
 
     transcriber.status = "loading"
     threading.Thread(target=run, daemon=True).start()
+
+
+async def need_whisper() -> None:
+    """The local engine is chosen or about to be used: load the Whisper model if nothing has yet.
+
+    It is not loaded when the backend starts: with the AssemblyAI engine (the page's default) it
+    would be downloaded (1.6 GB) and take about 4 GB of VRAM without ever being used."""
+    if transcriber.status != "idle":
+        return
+    load_model_in_background()
+    await broadcast_status()
 
 
 def request_model(model: object, compute: object) -> None:
@@ -207,7 +220,7 @@ async def lifespan(_: FastAPI):
     transcriber.on_progress = lambda: asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
     vad_model = SileroModel()
     translator = Translator()
-    load_model_in_background()
+    # The Whisper model is loaded when a page asks for the local engine (need_whisper).
     log.info("Open http://%s:%d in Chrome", HOST, PORT)
     yield
     await translator.close()
@@ -733,6 +746,8 @@ async def ws_audio(ws: WebSocket) -> None:
                     if isinstance(asr.get("assemblyai_key"), str):
                         opts["key"] = asr["assemblyai_key"].strip()
                     opts["ai_model"] = assembly.normalize_model(asr.get("assemblyai_model")) or opts["ai_model"]
+                    if opts["engine"] == "local":
+                        await need_whisper()
                     if run[0] in streams:  # language or glossary changed while capturing
                         streams[run[0]].update(opts["language"], assembly.keyterms(opts["prompt"]))
                 elif kind in ("start", "resume"):
@@ -758,6 +773,8 @@ async def ws_audio(ws: WebSocket) -> None:
                         stream.run = run[0]
                         streams[run[0]] = stream
                         stream.start()
+                    else:
+                        await need_whisper()
                     if old and old != run[0]:  # 0: no run yet on this connection
                         await send_run_done(old)
                 elif kind == "stop":

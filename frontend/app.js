@@ -10,9 +10,10 @@ const DEFAULTS = {
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
   asr: {
-    // Recognition engine: 'local' (Whisper on this PC) or 'assemblyai' (cloud, streaming), with
-    // its API key and model ('' is the backend's default, Universal-Streaming English).
-    engine: 'local',
+    // Recognition engine: 'assemblyai' (cloud, streaming) or 'local' (Whisper on this PC, which
+    // the backend loads only once this is chosen), with AssemblyAI's API key and model ('' is
+    // the backend's default, Universal-Streaming English).
+    engine: 'assemblyai',
     assemblyKey: '',
     assemblyModel: '',
     language: 'it_en',
@@ -454,6 +455,7 @@ function showModel() {
     setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
   }
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+  else setPill(el, '模型：未加载'); // idle: the backend loads Whisper once it is sent this engine
 }
 
 function onStatus(msg) {
@@ -1348,6 +1350,10 @@ async function describeShare(input) {
 async function start() {
   if (!state.wsReady) {
     showMsg('后端未连接，请先运行 start.bat');
+    return;
+  }
+  if (settings.asr.engine === 'assemblyai' && !settings.asr.assemblyKey.trim()) {
+    showMsg('请先在「设置 → 识别」填写 AssemblyAI API Key，或把识别引擎改为本地 Whisper');
     return;
   }
   showMsg('');
