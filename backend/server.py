@@ -764,10 +764,18 @@ async def ws_audio(ws: WebSocket) -> None:
                         streams[old].close()  # normally closed already, by "stop"
                     if run[0] in streams:
                         streams.pop(run[0]).abort()
-                    cloud[0] = opts["engine"] == "assemblyai"
+                    # The run's engine, key and model come with the message: the page fixes them
+                    # when the run starts and repeats them on "resume". The settings may have
+                    # changed since (they apply from the next 开始), and audio captured for the
+                    # local engine must not be sent to AssemblyAI when the run is resumed.
+                    engine = data.get("engine") if data.get("engine") in ("local", "assemblyai") else opts["engine"]
+                    key = data.get("assemblyai_key")
+                    key = key.strip() if isinstance(key, str) else opts["key"]
+                    ai_model = assembly.normalize_model(data.get("assemblyai_model")) or opts["ai_model"]
+                    cloud[0] = engine == "assemblyai"
                     if cloud[0]:
                         stream = assembly.AssemblyStream(
-                            opts["key"], opts["ai_model"], opts["language"],
+                            key, ai_model, opts["language"],
                             assembly.keyterms(opts["prompt"]), on_stream,
                         )
                         stream.run = run[0]

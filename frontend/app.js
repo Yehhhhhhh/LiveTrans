@@ -322,7 +322,7 @@ function resumeStream(buf = resend, run = state.run) {
   const first = buf.chunks[0];
   const from = Math.max(buf.committed, first ? first.pos : buf.pos);
   const lost = (from - buf.committed) / 16000;
-  wsSend({ type: 'resume', offset: from, run });
+  wsSend({ type: 'resume', offset: from, run, ...runEngine.get(run) });
   buf.committed = from;
   let sent = 0;
   for (const ch of buf.chunks) {
@@ -426,8 +426,19 @@ function startRun() {
   state.streamStartWall = Date.now();
   state.runWall.set(state.run, state.streamStartWall);
   for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
-  wsSend({ type: 'start', run: state.run });
+  runEngine.set(state.run, {
+    engine: settings.asr.engine,
+    assemblyai_key: settings.asr.assemblyKey,
+    assemblyai_model: settings.asr.assemblyModel,
+  });
+  for (const r of runEngine.keys()) if (r < state.run - 20) runEngine.delete(r);
+  wsSend({ type: 'start', run: state.run, ...runEngine.get(state.run) });
 }
+
+// run -> the recognition engine (with its key and model) it was started with. Sent again when the
+// run is resumed after a dropped connection: a change in the settings applies from the next 开始,
+// and a run captured for the local engine must not have its kept audio sent to the cloud.
+const runEngine = new Map();
 
 const ASSEMBLY_LABELS = {
   '': 'Universal-Streaming English',

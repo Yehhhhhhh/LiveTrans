@@ -489,3 +489,23 @@ def test_the_local_engine_is_the_default(fake, hub):
         sock.send_bytes(b"\0" * 3200)
         assert read_until(sock, lambda m: m["type"] == "segment")[-1]["text"] == "testo 1"
     assert hub.calls == []
+
+
+def test_a_resumed_run_keeps_the_engine_it_was_started_with(fake, hub):
+    # Captured with the local engine; AssemblyAI was chosen meanwhile (applies from the next 开始),
+    # then the connection dropped: the page resumes the run and resends its kept audio.
+    with cloud_session(start={"type": "resume", "run": 3, "offset": 0, "engine": "local"}) as sock:
+        sock.send_bytes(b"\0" * 3200)
+        assert read_until(sock, lambda m: m["type"] == "segment")[-1]["text"] == "testo 1"
+    assert hub.calls == []  # nothing went to AssemblyAI
+
+
+def test_a_resumed_cloud_run_keeps_its_key_and_model(fake, hub):
+    pinned = {"engine": "assemblyai", "assemblyai_key": "old key", "assemblyai_model": PRO}
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as client, client.websocket_connect("ws://127.0.0.1:8765/ws") as sock:
+        assert sock.receive_json()["type"] == "status"
+        sock.send_json({"type": "config", "asr": {"engine": "local", "assemblyai_key": "new key", "language": "it"}})
+        sock.send_json({"type": "resume", "run": 3, "offset": 0, **pinned})
+        read_until(sock, lambda m: m["type"] == "engine" and m["state"] == "ready")
+    assert hub.calls == [(assembly.stream_url(PRO, "it"), "old key")]
+    assert fake.calls == 0
