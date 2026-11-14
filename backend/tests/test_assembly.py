@@ -109,6 +109,7 @@ def hub(monkeypatch):
     h = Hub()
     monkeypatch.setattr(assembly, "open_socket", h)
     monkeypatch.setattr(assembly, "RETRY_S", 0)
+    monkeypatch.setattr(assembly, "SPEED", 1000.0)  # the tests don't wait for audio to play out
     return h
 
 
@@ -212,6 +213,59 @@ def test_audio_is_sent_in_50ms_chunks_after_the_keyterms(hub):
     assert sock.texts()[-1] == {"type": "Terminate"}
     assert [e["state"] for e in kinds(events, "state")] == ["connecting", "ready"]
     assert events[-1] == {"kind": "closed"}
+
+
+def sent_at(sock):
+    """Records when each audio chunk reaches the fake AssemblyAI (seconds, time.monotonic)."""
+    times = []
+    send = sock.send
+
+    async def timed(data):
+        if isinstance(data, bytes):
+            times.append(time.monotonic())
+        await send(data)
+
+    sock.send = timed
+    return times
+
+
+def test_queued_audio_is_sent_no_faster_than_it_was_captured(hub, monkeypatch):
+    """Audio that queued up before the session was ready (or is resent to a new session) must
+    not go out in one burst: AssemblyAI wants it at the speed of a live microphone."""
+    monkeypatch.setattr(assembly, "SPEED", 10.0)  # ten times faster than real, to keep the test short
+    monkeypatch.setattr(assembly, "BURST_S", 0.1)
+
+    async def body(s, events):
+        s.feed(CHUNK * 40)  # 2 s of audio, before the connection is there
+        await until(lambda: hub.sockets)
+        times = sent_at(hub.sockets[0])
+        await until(lambda: hub.sockets[0].chunks == 40)
+        # 2 s of audio at 10x: 0.2 s, less the 0.1 s (of audio) it may run ahead.
+        assert times[-1] - times[0] >= 0.17
+        s.close()
+        await until(lambda: s.done)
+
+    run_stream(hub, ENGLISH, "en", [], body)
+
+
+def test_live_audio_is_not_held_back(hub, monkeypatch):
+    """Audio arriving as it is captured goes out at once, and a change of settings is not kept
+    waiting behind queued audio."""
+    monkeypatch.setattr(assembly, "SPEED", 1.0)
+
+    async def body(s, events):
+        await until(lambda: kinds(events, "state")[-1:] == [{"kind": "state", "state": "ready"}])
+        sock = hub.sockets[0]
+        t0 = time.monotonic()
+        s.feed(CHUNK * 4)
+        await until(lambda: sock.chunks == 4)
+        assert time.monotonic() - t0 < 0.1  # within what it may run ahead: not 50 ms apart
+        s.feed(CHUNK * 20)  # a second of audio at once: this does take its time
+        s.update("en", ["Keynes"])
+        await until(lambda: {"type": "UpdateConfiguration", "keyterms_prompt": ["Keynes"]} in sock.texts())
+        assert sock.chunks < 24
+
+    run_stream(hub, ENGLISH, "en", [], body)
 
 
 def test_formatted_models_end_a_turn_twice_and_report_it_once(hub):

@@ -29,6 +29,14 @@ DEFAULT_MODEL = ENGLISH
 
 # Audio goes out in chunks of this size (the API accepts 20-1000 ms per message).
 CHUNK_BYTES = 1600  # 50 ms of 16 kHz PCM16
+# Audio must reach AssemblyAI no faster than it was captured: sent faster, it is transcribed
+# worse or the session is closed. Audio that queued up (while connecting, or kept for a new
+# session after the connection dropped) therefore goes out at this speed too, and the results
+# stay that much behind until the capture is stopped. SPEED: seconds of audio per second.
+SPEED = 1.0
+# The sender may run ahead of that schedule by this much audio, to make up for its own late
+# wake-ups. Well within the API's limit: one message may carry up to a second of audio.
+BURST_S = 0.2
 # Audio is kept until it is committed (see AssemblyStream.committed), so that a new session can
 # be given it again after the connection to AssemblyAI drops. At most this much.
 KEEP_S = 120
@@ -310,17 +318,25 @@ class AssemblyStream:
         await self._begun.wait()
         if self.terms:
             await ws.send(json.dumps({"type": "UpdateConfiguration", "keyterms_prompt": self.terms}))
+        next_at = 0.0  # on time.monotonic(): the next chunk is not sent before this (see SPEED)
         while True:
             if self._pending:
                 change, self._pending = self._pending, {}
                 await ws.send(json.dumps({"type": "UpdateConfiguration", **change}))
-            while self._sent_count < len(self._chunks):
+            if self._sent_count < len(self._chunks):
+                wait = next_at - time.monotonic()
+                if wait > 0:
+                    # The queue can change meanwhile (audio committed or too old is dropped).
+                    await asyncio.sleep(wait)
+                    continue
                 pos, chunk = self._chunks[self._sent_count]
                 self._sent_count += 1
                 await ws.send(chunk)
+                next_at = max(next_at, time.monotonic() - BURST_S / SPEED) + len(chunk) / 32000 / SPEED
                 self._sent_pos = pos + len(chunk) // 2
                 if self._open is None:
                     self._commit(self._sent_pos - round(SILENCE_MARGIN_S * 16000))
+                continue
             if self._closing and not self._pending:
                 self._terminate_sent = True
                 await ws.send(json.dumps({"type": "Terminate"}))
