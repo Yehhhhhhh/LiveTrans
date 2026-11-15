@@ -162,6 +162,14 @@ def clean_text(text: str, prompt: str = "") -> str:
 PROMPT_TOKENS = 215
 
 
+def prompt_parts(prompt: str) -> tuple[str, list[str]]:
+    """The course hint and the glossary terms of the page's prompt (built as split_prompt says)."""
+    hint, sep, rest = prompt.partition(". ")
+    if not sep:
+        hint, rest = "", prompt
+    return hint.strip(), [t.strip() for t in rest.strip().rstrip(".").split(", ") if t.strip()]
+
+
 def fit_prompt(count, prompt: str, context: str = "") -> str:
     """The Whisper prompt for one segment: `prompt` (see split_prompt) followed by `context`, the
     text recognized just before, cut down to PROMPT_TOKENS so that nothing is dropped silently.
@@ -174,11 +182,8 @@ def fit_prompt(count, prompt: str, context: str = "") -> str:
     context = context.strip()
     if not prompt and not context:
         return ""
-    hint, sep, rest = prompt.partition(". ")
-    if not sep:
-        hint, rest = "", prompt
-    head = f"{hint.strip()}. " if hint.strip() else ""
-    terms = [t.strip() for t in rest.strip().rstrip(".").split(", ") if t.strip()]
+    hint, terms = prompt_parts(prompt)
+    head = f"{hint}. " if hint else ""
 
     budget = PROMPT_TOKENS - (count(head) if head else 0)
     while context and count(context) > budget:
