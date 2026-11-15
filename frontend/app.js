@@ -1199,6 +1199,10 @@ async function getSystemStream() {
     video: true,
     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     systemAudio: 'include',
+    // For a shared window, capture that window's own sound. Chrome's default is the whole
+    // system's audio, so every other program playing sound got subtitles too. (Chrome 141+;
+    // older versions ignore the option and still capture everything.)
+    windowAudio: 'window',
     selfBrowserSurface: 'exclude',
     // Chrome then offers "share this tab instead" in its share bar, switching tabs without a prompt.
     surfaceSwitching: 'include',
