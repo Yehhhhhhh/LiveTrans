@@ -480,6 +480,16 @@ async def ws_audio(ws: WebSocket) -> None:
     # after the next run began.
     bases: dict[int, int] = {}
     unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
+    # Segments of the current run discarded as noise (too little speech). A partial of one may
+    # still be running in its worker thread when the page is told to drop the line: its text must
+    # not be sent afterwards, or the line would come back and stay ("识别中…") with nothing to
+    # replace it until the next sentence.
+    gone: set[int] = set()
+
+    async def send_dropped() -> None:
+        for index in seg.take_dropped():
+            gone.add(index)
+            await ws.send_json({"type": "partial_drop", "index": index})
 
     def committed() -> int:
         if run[0] in streams:
@@ -678,12 +688,13 @@ async def ws_audio(ws: WebSocket) -> None:
     async def run_partial(audio, index: int, audio_end: float) -> None:
         # audio_end: the stream position (seconds) of the newest audio in `audio`; the page shows
         # how long after sending that audio its text came back.
+        started_in = run[0]  # 开始 pressed again meanwhile: the index means another segment now
         try:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
                 text = await to_thread_to_end(partial_job, audio, index)
-            if text and index > live["final_sent"]:
+            if text and index > live["final_sent"] and index not in gone and run[0] == started_in:
                 await ws.send_json({"type": "partial", "index": index, "text": text, "audio_end": audio_end})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
             log.debug("Partial transcription failed", exc_info=True)
@@ -742,8 +753,7 @@ async def ws_audio(ws: WebSocket) -> None:
                         queue.put_nowait(s)
                     if new:
                         await send_backlog()
-                    for index in seg.take_dropped():
-                        await ws.send_json({"type": "partial_drop", "index": index})
+                    await send_dropped()
                 now = time.monotonic()
                 if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
                     speaking = seg.speaking
@@ -814,6 +824,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     r = data.get("run")
                     run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
+                    gone.clear()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                     ctx.update(text="", lang="")
                     bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
@@ -867,8 +878,7 @@ async def ws_audio(ws: WebSocket) -> None:
                         queue.put_nowait(s)
                     if new:
                         await send_backlog()
-                    for index in seg.take_dropped():
-                        await ws.send_json({"type": "partial_drop", "index": index})
+                    await send_dropped()
                     speaking = False
                     await ws.send_json({"type": "vad", "speaking": False})
     except WebSocketDisconnect:

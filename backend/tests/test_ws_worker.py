@@ -152,3 +152,48 @@ def test_results_carry_their_capture_run_after_a_restart(fake):
             segs.append(read_until(sock, lambda m: m["type"] == "segment")[-1])
         # Never merged across runs, and each result names its own run.
         assert [(s["run"], s["merged"]) for s in segs] == [(1, 1), (2, 1)]
+
+
+def test_partial_of_a_dropped_segment_is_not_sent_after_the_drop(fake, monkeypatch):
+    """A noise burst: its live transcription is still running when the segment is discarded as
+    too short. The text must not reach the page afterwards, where nothing would replace it."""
+    import threading
+
+    release = threading.Event()
+
+    class NoiseThenSpeech(FakeSegmenter):
+        def feed(self, pcm):
+            self.calls = getattr(self, "calls", 0) + 1
+            self.frames_seen += 100
+            if self.calls == 1:  # the burst begins: a partial is started
+                self.index, self.speaking = 1, True
+                return []
+            if self.calls == 2:  # too little speech: segment 1 is dropped
+                self.speaking, self.dropped = False, [1]
+                return []
+            self.index = 2
+            return [Segment(start=2.0, audio=np.zeros(16000, np.float32), index=2)]
+
+        def take_dropped(self):
+            out, self.dropped = getattr(self, "dropped", []), []
+            return out
+
+        def current_audio(self):
+            return np.zeros(16000, np.float32) if self.speaking else None
+
+    def transcribe_partial(audio, lang, prompt=""):
+        release.wait(5)
+        return "I'm going to go to the next level of"
+
+    fake.status = "ready"
+    fake.transcribe_partial = transcribe_partial
+    monkeypatch.setattr(server, "Segmenter", NoiseThenSpeech)
+    with session() as sock:
+        sock.send_json({"type": "config", "asr": {"partial": True, "language": "en"}})
+        sock.send_bytes(b"\0" * 3200)
+        sock.send_bytes(b"\0" * 3200)
+        seen = read_until(sock, lambda m: m["type"] == "partial_drop")
+        release.set()
+        sock.send_bytes(b"\0" * 3200)
+        seen += read_until(sock, lambda m: m["type"] == "segment")
+        assert not [m for m in seen if m["type"] == "partial"]

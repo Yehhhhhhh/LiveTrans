@@ -93,9 +93,8 @@ const state = {
   running: false,
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
-  streamStartWall: 0,
   run: 0, // capture run sent with every 'start'; the backend echoes it in its results
-  runWall: new Map(), // run -> its streamStartWall, for results of a run that already ended
+  runClock: new Map(), // run -> its clock (see clockTick); kept for results of runs that already ended
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
@@ -126,14 +125,15 @@ function showVad(msg) {
 // `lag`: how long after a piece of audio was sent its text came back (see audioLag).
 const asrStat = { ms: null, lag: null, merged: 1, pending: 0 };
 const fmtLag = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
-// Audio is sent as it is captured, so the audio at `audioEnd` (seconds on a run's stream clock)
-// left the page at `wall + audioEnd`. A text that covers the audio up to there arrived now.
-const audioLag = (wall, audioEnd) => Math.max(0, Math.round(Date.now() - (wall + audioEnd * 1000)));
+// Audio is sent as it is captured, so the audio at `audioEnd` (seconds on a run's stream) left
+// the page when the run's clock says it was captured (see wallAt). A text that covers the audio
+// up to there arrived now.
+const audioLag = (clock, audioEnd) => Math.max(0, Math.round(Date.now() - wallAt(clock, audioEnd)));
 // The delay of the newest partial transcript, and the segment it belongs to.
 let partialLag = { index: -1, lag: null };
 function notePartialLag(msg) {
   if (typeof msg.audio_end !== 'number') return;
-  partialLag = { index: msg.index, lag: audioLag(state.streamStartWall, msg.audio_end) };
+  partialLag = { index: msg.index, lag: audioLag(state.runClock.get(state.run), msg.audio_end) };
   asrStat.lag = partialLag.lag;
   showAsr();
 }
@@ -319,7 +319,42 @@ function trimResend(buf = resend) {
   while (c.length && buf.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
 }
 
+// A run's clock: when its audio was captured, by the computer's clock. Counting samples from the
+// moment 开始 was pressed is not enough: the audio clock runs a little off the computer's, and
+// stands still whenever no audio arrives (computer asleep, audio device changed, page frozen), so
+// every later sentence would be shown too early. Each entry says "from sample `pos` on, sample 0
+// would have been captured at `wall0`" (ms).
+const CLOCK_GAP_MS = 500; // audio arriving this much later than expected starts a new entry
+const CLOCK_MAX = 500;
+
+// Called for every chunk as it arrives; `pos` is the position of its first sample.
+function clockTick(clock, pos, len, now = Date.now()) {
+  const wall0 = now - ((pos + len) / 16000) * 1000;
+  const last = clock[clock.length - 1];
+  if (!last || wall0 > last.wall0 + CLOCK_GAP_MS) {
+    clock.push({ pos, wall0 });
+    if (clock.length > CLOCK_MAX) clock.shift();
+  } else if (wall0 < last.wall0) {
+    // Chunks reach the page a little late, never early: the earliest reading is the truest.
+    // (After a busy page delivers a burst of late chunks, this also brings the entry back.)
+    last.wall0 = wall0;
+  }
+}
+
+// When the audio `sec` seconds into a run was captured (ms since the epoch).
+function wallAt(clock, sec) {
+  if (!clock?.length) return Date.now();
+  let at = clock[0];
+  for (const c of clock) {
+    if (c.pos > sec * 16000) break;
+    at = c;
+  }
+  return at.wall0 + sec * 1000;
+}
+
 function sendAudio(pcm) {
+  const clock = state.runClock.get(state.run);
+  if (clock) clockTick(clock, resend.pos, pcm.length);
   resend.chunks.push({ pos: resend.pos, pcm });
   resend.pos += pcm.length;
   trimResend();
@@ -334,7 +369,8 @@ function onCommitted(pos, run) {
 }
 
 // Continue a run's stream where the backend can pick it up and resend its kept audio. Its
-// results keep the run's clock (start times continue from `from`). Returns seconds resent / lost.
+// results keep the run's clock (start times continue from `from`, and the audio keeps the time it
+// was captured at, not the time it is resent). Returns seconds resent / lost.
 function resumeStream(buf = resend, run = state.run) {
   const first = buf.chunks[0];
   const from = Math.max(buf.committed, first ? first.pos : buf.pos);
@@ -441,10 +477,9 @@ function connectWs() {
 // current run's live state.
 function startRun() {
   state.run += 1;
-  state.streamStartWall = Date.now();
   partialLag = { index: -1, lag: null }; // indices start over with the run
-  state.runWall.set(state.run, state.streamStartWall);
-  for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
+  state.runClock.set(state.run, []);
+  for (const r of state.runClock.keys()) if (r < state.run - 20) state.runClock.delete(r);
   runEngine.set(state.run, {
     engine: settings.asr.engine,
     assemblyai_key: settings.asr.assemblyKey,
@@ -623,7 +658,7 @@ async function onSegment(msg) {
   const text = (msg.text || '').trim();
   // A result of an earlier run: its indices don't refer to the current run's partials.
   const current = msg.run === undefined || msg.run === state.run;
-  const wall = current ? state.streamStartWall : state.runWall.get(msg.run) ?? state.streamStartWall;
+  const clock = state.runClock.get(current ? state.run : msg.run) ?? state.runClock.get(state.run);
   if (current) {
     // Partials of earlier segments can no longer be finalized.
     transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
@@ -647,12 +682,12 @@ async function onSegment(msg) {
   const asrLag =
     current && partialLag.index === msg.index && partialLag.lag != null
       ? partialLag.lag
-      : audioLag(wall, msg.start + msg.duration);
+      : audioLag(clock, msg.start + msg.duration);
   const segs = sentences.map((s) => {
     const seg = {
       id: crypto.randomUUID(),
       sessionId: state.session.id,
-      ts: wall + (msg.start + (msg.duration * offset) / total) * 1000,
+      ts: wallAt(clock, msg.start + (msg.duration * offset) / total),
       lang: msg.lang,
       text: s,
       translation: '',
@@ -1207,6 +1242,10 @@ async function getSystemStream() {
     video: true,
     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     systemAudio: 'include',
+    // For a shared window, capture that window's own sound. Chrome's default is the whole
+    // system's audio, so every other program playing sound got subtitles too. (Chrome 141+;
+    // older versions ignore the option and still capture everything.)
+    windowAudio: 'window',
     selfBrowserSurface: 'exclude',
     // Chrome then offers "share this tab instead" in its share bar, switching tabs without a prompt.
     surfaceSwitching: 'include',
