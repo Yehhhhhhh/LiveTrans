@@ -79,3 +79,19 @@ def test_transcribe_uses_the_mode(t, setting, decoded_as):
     res = t.transcribe(AUDIO, setting)
     assert t.model.calls[-1]["language"] == decoded_as
     assert res["lang"] == decoded_as
+
+
+def test_partial_drops_what_the_final_pass_would_reject():
+    """Noise decoded as a fluent sentence (low confidence, probably not speech) isn't shown live."""
+    from types import SimpleNamespace
+
+    def piece(text, logprob, no_speech):
+        return SimpleNamespace(text=text, avg_logprob=logprob, no_speech_prob=no_speech, compression_ratio=1.0)
+
+    class Model:
+        def transcribe(self, audio, **kw):
+            return [piece("Allora cominciamo", -0.2, 0.1), piece("I'm going to go to the next level of", -0.8, 0.9)], None
+
+    tr = Transcriber()
+    tr.model = Model()
+    assert tr.transcribe_partial(np.zeros(16000, np.float32), "it") == "Allora cominciamo"

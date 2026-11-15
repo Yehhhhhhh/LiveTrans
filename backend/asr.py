@@ -214,6 +214,15 @@ def echoes_context(text: str, context: str) -> bool:
     return unspaced and len(flat) >= 8 and "".join(before).endswith(flat)
 
 
+def unreliable(s) -> bool:
+    """Whether a decoded Whisper segment should be thrown away: still a repeat loop, very unsure,
+    or probably not speech at all. On noise, music or a breath Whisper writes a fluent sentence
+    anyway ("I'm going to go to the next level of..."); these scores are what gives it away."""
+    if s.compression_ratio > 2.4 or s.avg_logprob < -1.0:
+        return True
+    return s.no_speech_prob > 0.5 and s.avg_logprob < -0.5
+
+
 def setup_cuda_dlls() -> None:
     """Make the pip-installed CUDA/cuDNN DLLs (nvidia-*-cu12) loadable on Windows."""
     if os.name != "nt":
@@ -402,7 +411,8 @@ class Transcriber:
             without_timestamps=True,
             initial_prompt=initial_prompt or None,
         )
-        text = clean_text(" ".join(s.text.strip() for s in segments if s.text.strip()), prompt)
+        # Same checks as the final pass: a hallucination must not be shown (and translated) live.
+        text = clean_text(" ".join(s.text.strip() for s in segments if s.text.strip() and not unreliable(s)), prompt)
         # Whisper ends cut-off audio with "..." or "."; dropping it keeps the last word stable on screen.
         return re.sub(r"[.…]+$", "", text).strip()
 
@@ -440,11 +450,8 @@ class Transcriber:
         )
         parts = []
         for s in segments:
-            # Even after temperature fallback Whisper returns its last attempt; reject it here
-            # if it is still a repeat loop, very unsure, or probably not speech at all.
-            if s.compression_ratio > 2.4 or s.avg_logprob < -1.0:
-                continue
-            if s.no_speech_prob > 0.5 and s.avg_logprob < -0.5:
+            # Even after temperature fallback Whisper returns its last attempt; reject it here.
+            if unreliable(s):
                 continue
             text = clean_text(s.text, prompt)
             if text:
