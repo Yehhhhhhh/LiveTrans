@@ -174,6 +174,7 @@ async def until(pred, timeout=2.0):
         await asyncio.sleep(0.005)
 
 
+
 def run_stream(hub, model, language, terms, body):
     """Run `body(stream, events)` with a started stream; returns the events it reported."""
     events = []
@@ -264,6 +265,27 @@ def test_live_audio_is_not_held_back(hub, monkeypatch):
         s.update("en", ["Keynes"])
         await until(lambda: {"type": "UpdateConfiguration", "keyterms_prompt": ["Keynes"]} in sock.texts())
         assert sock.chunks < 24
+
+    run_stream(hub, ENGLISH, "en", [], body)
+
+
+def test_audio_that_queues_up_during_the_session_is_sent_at_once(hub, monkeypatch):
+    """Only audio from before the session has to be held back. While the session is open, time
+    with nothing to send is credit: a page that stalled and then delivers its audio in one go is
+    not kept behind for the rest of the run."""
+    monkeypatch.setattr(assembly, "SPEED", 1.0)
+
+    async def body(s, events):
+        await until(lambda: kinds(events, "state")[-1:] == [{"kind": "state", "state": "ready"}])
+        sock = hub.sockets[0]
+        await asyncio.sleep(0.5)  # the session is half a second old, and nothing was sent
+        t0 = time.monotonic()
+        s.feed(CHUNK * 12)  # 0.6 s of audio at once
+        await until(lambda: sock.chunks == 12)
+        assert time.monotonic() - t0 < 0.2
+        s.feed(CHUNK * 40)  # the credit is used up, and it is never more than MAX_BURST_S
+        await asyncio.sleep(0.2)
+        assert sock.chunks < 12 + 20
 
     run_stream(hub, ENGLISH, "en", [], body)
 
@@ -562,4 +584,50 @@ def test_a_resumed_cloud_run_keeps_its_key_and_model(fake, hub):
         sock.send_json({"type": "resume", "run": 3, "offset": 0, **pinned})
         read_until(sock, lambda m: m["type"] == "engine" and m["state"] == "ready")
     assert hub.calls == [(assembly.stream_url(PRO, "it"), "old key")]
+    assert fake.calls == 0
+
+
+# ---------------------------------------------------------------- connecting ahead of the run
+
+
+def prepared_session():
+    return cloud_session(start={"type": "prepare", "engine": "assemblyai", "assemblyai_key": "key"})
+
+
+def test_the_connection_opened_when_start_is_pressed_serves_the_run(fake, hub):
+    hub.scripts = [HELLO]
+    with prepared_session() as sock:
+        # Connected while the page asks for its sources: nothing is reported for it yet.
+        asyncio.run(until(lambda: hub.sockets))
+        sock.send_json({"type": "start", "run": 1, "engine": "assemblyai", "assemblyai_key": "key"})
+        sock.send_bytes(CHUNK * 4)
+        seen = read_until(sock, lambda m: m["type"] == "segment")
+        assert {m["run"] for m in seen if m["type"] == "engine"} == {1}
+        assert [m["state"] for m in seen if m["type"] == "engine"][-1] == "ready"
+        assert (seen[-1]["text"], seen[-1]["run"]) == ("Hello world.", 1)
+    assert len(hub.calls) == 1  # the run used that connection
+
+
+def test_a_prepared_connection_is_closed_when_no_capture_follows(fake, hub):
+    with prepared_session() as sock:
+        asyncio.run(until(lambda: hub.sockets))
+        sock.send_json({"type": "unprepare"})
+        asyncio.run(until(lambda: {"type": "Terminate"} in hub.sockets[0].texts()))
+        sock.send_json({"type": "stop"})
+        seen = read_until(sock, lambda m: m["type"] == "vad")
+        assert not [m for m in seen if m["type"] in ("engine", "run_done", "error")]
+    assert len(hub.calls) == 1
+
+
+def test_a_prepared_connection_is_not_used_for_another_key_or_engine(fake, hub):
+    with prepared_session() as sock:
+        asyncio.run(until(lambda: hub.sockets))
+        sock.send_json({"type": "start", "run": 1, "engine": "assemblyai", "assemblyai_key": "other"})
+        read_until(sock, lambda m: m["type"] == "engine" and m["state"] == "ready")
+        assert [key for _, key in hub.calls] == ["key", "other"]
+        assert {"type": "Terminate"} in hub.sockets[0].texts()
+        sock.send_json({"type": "prepare", "engine": "assemblyai", "assemblyai_key": "key"})
+        asyncio.run(until(lambda: len(hub.sockets) == 3))
+        sock.send_json({"type": "start", "run": 2, "engine": "local"})
+        asyncio.run(until(lambda: {"type": "Terminate"} in hub.sockets[2].texts()))
     assert fake.calls == 0
