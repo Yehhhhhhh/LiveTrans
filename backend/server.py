@@ -28,13 +28,11 @@ from pydantic import BaseModel  # noqa: E402
 from starlette.websockets import WebSocketState  # noqa: E402
 
 import assembly  # noqa: E402
-from asr import Transcriber  # noqa: E402
+from asr import IT_EN, Transcriber, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
 from guard import LocalOnlyMiddleware  # noqa: E402
-from translate import TranslateError, Translator, clean_output, clean_partial  # noqa: E402
+from translate import DEFAULT_DOMAIN, TranslateError, Translator, clean_output, clean_partial  # noqa: E402
 from vad import FRAME, Segment, Segmenter, SegmenterParams, SileroModel  # noqa: E402
 from winfo import window_info  # noqa: E402
-from asr import IT_EN, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
-from translate import DEFAULT_DOMAIN  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -81,6 +79,8 @@ async def to_thread_to_end(fn, *args):
     except asyncio.CancelledError:
         await asyncio.wait({fut})
         raise
+
+
 clients: set[WebSocket] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
@@ -250,8 +250,10 @@ async def api_status() -> dict:
 
 
 @app.get("/api/window")
-async def api_window(hwnd: int) -> dict:
+def api_window(hwnd: int) -> dict:
     """Name of a shared window: Chrome's window-capture track label carries its native handle."""
+    # Not async: the Windows calls block (asking a window for its icon waits up to 200 ms per
+    # try), so this runs in a worker thread and the audio WebSocket keeps being served meanwhile.
     info = window_info(hwnd)
     if info is None:
         raise HTTPException(404, "window not found")
@@ -404,7 +406,6 @@ def take_batch(first: Segment, queue: asyncio.Queue) -> tuple[list[Segment], Seg
             return items, nxt
         items.append(nxt)
     return items, None
-
 
 
 def open_recording() -> wave.Wave_write:

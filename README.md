@@ -190,12 +190,12 @@
 | `LIVETRANS_HOST` | `127.0.0.1` | 监听地址 |
 | `LIVETRANS_PORT` | `8765` | 端口 |
 | `LIVETRANS_ALLOWED_HOSTS` | - | 除 `localhost` 和 IP 地址外，还允许用哪些主机名打开页面，逗号分隔（例如 `LIVETRANS_HOST=0.0.0.0` 时本机的网络名） |
+| `LIVETRANS_RECORD` | - | 设为 `1` 时把每次采集的原始 16kHz 音频保存到 `recordings/`，用于调参 |
+| `HF_ENDPOINT` | - | HuggingFace 镜像 |
 
 后端只接受来自自己页面的请求：浏览器里打开的其他网站不能连接 `/ws` 或调用 API（会被拒绝并在日志中记录），命令行工具、脚本不受影响。用 IP 地址或 `localhost` 打开页面都可以；用其他主机名打开时，需要把它加到 `LIVETRANS_ALLOWED_HOSTS`。
 
 注意：设置 `LIVETRANS_HOST=0.0.0.0` 让局域网访问时，同一网络中的任何人都可以使用这个后端，包括用它转发翻译请求，请只在可信网络中这样做。
-| `LIVETRANS_RECORD` | - | 设为 `1` 时把每次采集的原始 16kHz 音频保存到 `recordings/`，用于调参 |
-| `HF_ENDPOINT` | - | HuggingFace 镜像 |
 
 ## 测试
 
@@ -215,6 +215,7 @@ backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（识别语言模式）、幻觉过滤
 backend/assembly.py    AssemblyAI 流式识别（云端识别引擎）
 backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
+backend/guard.py       只放行本页面的请求：检查 Host / Origin，挡住其他网站和 DNS 重绑定
 backend/winfo.py       由窗口句柄查程序名、窗口标题和图标（Windows API）
 backend/tests/         pytest 单元测试（依赖见 requirements-dev.txt）
 frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB 记录
