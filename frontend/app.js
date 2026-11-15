@@ -10,6 +10,12 @@ const DEFAULTS = {
   // Browser noise suppression treats a distant, soft-spoken lecturer as noise, so it is off by default.
   audio: { micGain: 1, sysGain: 1, micProcessing: false },
   asr: {
+    // Recognition engine: 'assemblyai' (cloud, streaming) or 'local' (Whisper on this PC, which
+    // the backend loads only once this is chosen), with AssemblyAI's API key and model ('' is
+    // the backend's default, Universal-Streaming English).
+    engine: 'assemblyai',
+    assemblyKey: '',
+    assemblyModel: '',
     language: 'it_en',
     lastOther: 'fr',
     // Whisper model and compute type (weight precision), from those the backend offers;
@@ -87,9 +93,8 @@ const state = {
   running: false,
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
-  streamStartWall: 0,
   run: 0, // capture run sent with every 'start'; the backend echoes it in its results
-  runWall: new Map(), // run -> its streamStartWall, for results of a run that already ended
+  runClock: new Map(), // run -> its clock (see clockTick); kept for results of runs that already ended
   session: null,
   segments: [], // segments of the current session, in order
   trQueue: [],
@@ -243,6 +248,9 @@ function asrConfig() {
   return {
     type: 'config',
     asr: {
+      engine: settings.asr.engine,
+      assemblyai_key: settings.asr.assemblyKey,
+      assemblyai_model: settings.asr.assemblyModel,
       language: settings.asr.language,
       model: settings.asr.model,
       compute: settings.asr.compute,
@@ -293,7 +301,42 @@ function trimResend(buf = resend) {
   while (c.length && buf.pos - c[0].pos > RESEND_MAX_S * 16000) c.shift();
 }
 
+// A run's clock: when its audio was captured, by the computer's clock. Counting samples from the
+// moment 开始 was pressed is not enough: the audio clock runs a little off the computer's, and
+// stands still whenever no audio arrives (computer asleep, audio device changed, page frozen), so
+// every later sentence would be shown too early. Each entry says "from sample `pos` on, sample 0
+// would have been captured at `wall0`" (ms).
+const CLOCK_GAP_MS = 500; // audio arriving this much later than expected starts a new entry
+const CLOCK_MAX = 500;
+
+// Called for every chunk as it arrives; `pos` is the position of its first sample.
+function clockTick(clock, pos, len, now = Date.now()) {
+  const wall0 = now - ((pos + len) / 16000) * 1000;
+  const last = clock[clock.length - 1];
+  if (!last || wall0 > last.wall0 + CLOCK_GAP_MS) {
+    clock.push({ pos, wall0 });
+    if (clock.length > CLOCK_MAX) clock.shift();
+  } else if (wall0 < last.wall0) {
+    // Chunks reach the page a little late, never early: the earliest reading is the truest.
+    // (After a busy page delivers a burst of late chunks, this also brings the entry back.)
+    last.wall0 = wall0;
+  }
+}
+
+// When the audio `sec` seconds into a run was captured (ms since the epoch).
+function wallAt(clock, sec) {
+  if (!clock?.length) return Date.now();
+  let at = clock[0];
+  for (const c of clock) {
+    if (c.pos > sec * 16000) break;
+    at = c;
+  }
+  return at.wall0 + sec * 1000;
+}
+
 function sendAudio(pcm) {
+  const clock = state.runClock.get(state.run);
+  if (clock) clockTick(clock, resend.pos, pcm.length);
   resend.chunks.push({ pos: resend.pos, pcm });
   resend.pos += pcm.length;
   trimResend();
@@ -308,12 +351,13 @@ function onCommitted(pos, run) {
 }
 
 // Continue a run's stream where the backend can pick it up and resend its kept audio. Its
-// results keep the run's clock (start times continue from `from`). Returns seconds resent / lost.
+// results keep the run's clock (start times continue from `from`, and the audio keeps the time it
+// was captured at, not the time it is resent). Returns seconds resent / lost.
 function resumeStream(buf = resend, run = state.run) {
   const first = buf.chunks[0];
   const from = Math.max(buf.committed, first ? first.pos : buf.pos);
   const lost = (from - buf.committed) / 16000;
-  wsSend({ type: 'resume', offset: from, run });
+  wsSend({ type: 'resume', offset: from, run, ...runEngine.get(run) });
   buf.committed = from;
   let sent = 0;
   for (const ch of buf.chunks) {
@@ -399,6 +443,12 @@ function connectWs() {
       asrStat.pending = msg.pending;
       if (!msg.pending) asrStat.merged = 1; // caught up: the merge note no longer applies
       showAsr();
+    } else if (msg.type === 'engine') {
+      // The AssemblyAI stream of a run: connecting / ready / error / closed.
+      if (msg.run === state.run) {
+        engineState = msg.state === 'closed' ? '' : msg.state;
+        showModel();
+      }
     } else if (msg.type === 'error') showMsg(msg.message);
   };
 }
@@ -408,20 +458,54 @@ function connectWs() {
 // current run's live state.
 function startRun() {
   state.run += 1;
-  state.streamStartWall = Date.now();
-  state.runWall.set(state.run, state.streamStartWall);
-  for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
-  wsSend({ type: 'start', run: state.run });
+  state.runClock.set(state.run, []);
+  for (const r of state.runClock.keys()) if (r < state.run - 20) state.runClock.delete(r);
+  runEngine.set(state.run, {
+    engine: settings.asr.engine,
+    assemblyai_key: settings.asr.assemblyKey,
+    assemblyai_model: settings.asr.assemblyModel,
+  });
+  for (const r of runEngine.keys()) if (r < state.run - 20) runEngine.delete(r);
+  wsSend({ type: 'start', run: state.run, ...runEngine.get(state.run) });
 }
 
-function onStatus(msg) {
+// run -> the recognition engine (with its key and model) it was started with. Sent again when the
+// run is resumed after a dropped connection: a change in the settings applies from the next 开始,
+// and a run captured for the local engine must not have its kept audio sent to the cloud.
+const runEngine = new Map();
+
+const ASSEMBLY_LABELS = {
+  '': 'Universal-Streaming English',
+  'universal-streaming-multilingual': 'Universal-Streaming Multilingual',
+  'universal-3-6-pro': 'Universal-3.6 Pro',
+};
+let whisperStatus = null; // the backend's last 'status' message
+let engineState = ''; // of the current run's AssemblyAI stream: connecting | ready | error | ''
+
+// The status bar's model pill: the Whisper model, or AssemblyAI when that engine is chosen.
+function showModel() {
   const el = $('stModel');
+  if (settings.asr.engine === 'assemblyai') {
+    const name = ASSEMBLY_LABELS[settings.asr.assemblyModel] || settings.asr.assemblyModel;
+    if (engineState === 'connecting') setPill(el, '模型：AssemblyAI 连接中…', 'warn');
+    else if (engineState === 'error') setPill(el, '模型：AssemblyAI 连接失败', 'err');
+    else setPill(el, `模型：AssemblyAI · ${name}`, engineState === 'ready' ? 'ok' : '');
+    return;
+  }
+  const msg = whisperStatus;
+  if (!msg) return;
   if (msg.model === 'ready') setPill(el, `模型：${msg.model_name} · ${msg.device}/${msg.compute_type}`, msg.device === 'cuda' ? 'ok' : 'warn');
   else if (msg.model === 'loading') {
     const dl = msg.download;
     setPill(el, dl ? `模型：下载中 ${Math.floor((dl.done / dl.total) * 100)}%` : '模型：加载中（首次需下载）…', 'warn');
   }
   else if (msg.model === 'error') setPill(el, '模型：加载失败', 'err');
+  else setPill(el, '模型：未加载'); // idle: the backend loads Whisper once it is sent this engine
+}
+
+function onStatus(msg) {
+  whisperStatus = msg;
+  showModel();
   showDownload(msg);
   if (msg.error) showMsg(msg.error);
   showAsrModels(msg);
@@ -554,7 +638,7 @@ async function onSegment(msg) {
   const text = (msg.text || '').trim();
   // A result of an earlier run: its indices don't refer to the current run's partials.
   const current = msg.run === undefined || msg.run === state.run;
-  const wall = current ? state.streamStartWall : state.runWall.get(msg.run) ?? state.streamStartWall;
+  const clock = state.runClock.get(current ? state.run : msg.run) ?? state.runClock.get(state.run);
   if (current) {
     // Partials of earlier segments can no longer be finalized.
     transcriptEl.querySelectorAll('.seg.live').forEach((el) => {
@@ -576,7 +660,7 @@ async function onSegment(msg) {
     const seg = {
       id: crypto.randomUUID(),
       sessionId: state.session.id,
-      ts: wall + (msg.start + (msg.duration * offset) / total) * 1000,
+      ts: wallAt(clock, msg.start + (msg.duration * offset) / total),
       lang: msg.lang,
       text: s,
       translation: '',
@@ -1317,13 +1401,30 @@ async function start() {
     showMsg('后端未连接，请先运行 start.bat');
     return;
   }
+  if (settings.asr.engine === 'assemblyai' && !settings.asr.assemblyKey.trim()) {
+    showMsg('请先在「设置 → 识别」填写 AssemblyAI API Key，或把识别引擎改为本地 Whisper');
+    return;
+  }
   showMsg('');
+  // The backend connects to AssemblyAI while the sources are being asked for (the window picker,
+  // a permission prompt): audio that had to wait for the connection would keep the whole run's
+  // subtitles that far behind.
+  const cloud = settings.asr.engine === 'assemblyai';
+  if (cloud) {
+    wsSend({
+      type: 'prepare',
+      engine: settings.asr.engine,
+      assemblyai_key: settings.asr.assemblyKey,
+      assemblyai_model: settings.asr.assemblyModel,
+    });
+  }
   const src = settings.source;
   const acquired = [];
   try {
     for (const kind of wantedKinds(src)) acquired.push({ kind, stream: await acquire(kind) });
   } catch (e) {
     acquired.forEach((a) => stopStream(a.stream));
+    if (cloud) wsSend({ type: 'unprepare' });
     showMsg(acquireError(e));
     return;
   }
@@ -1580,6 +1681,25 @@ const onModelChoice = () => {
   sendConfig();
   showVram();
 };
+// Settings that only the local Whisper engine uses are hidden while AssemblyAI is chosen.
+function showEngineFields() {
+  const cloud = settings.asr.engine === 'assemblyai';
+  $('assemblyFields').classList.toggle('hidden', !cloud);
+  document.querySelectorAll('.whisperOnly').forEach((el) => el.classList.toggle('hidden', cloud));
+}
+const onEngineChoice = () => {
+  showEngineFields();
+  // The pill shows the state of the running capture's engine, which stays as it is until 开始.
+  if (state.running) showMsg('识别引擎的改动在下一次「开始」生效');
+  else engineState = '';
+  showModel();
+  sendConfig();
+};
+bind('asrEngine', 'asr.engine', onEngineChoice);
+bind('aaiKey', 'asr.assemblyKey', sendConfig);
+bind('aaiModel', 'asr.assemblyModel', onEngineChoice);
+showEngineFields();
+showModel();
 bind('asrModel', 'asr.model', onModelChoice);
 bind('asrCompute', 'asr.compute', onModelChoice);
 bind('vadThr', 'asr.vadThreshold', sendConfig);
