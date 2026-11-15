@@ -158,6 +158,28 @@
 
     <section class="pane hidden" data-pane="asr">
       <div class="sect">
+        <h3>识别引擎</h3>
+        <label class="field">引擎
+          <select id="asrEngine">
+            <option value="assemblyai">AssemblyAI（云端，按时长计费）</option>
+            <option value="local">本地 Whisper（本机显卡）</option>
+          </select>
+        </label>
+        <div id="assemblyFields" class="hidden">
+          <label class="field">API Key <input id="aaiKey" type="password" autocomplete="off"></label>
+          <label class="field">模型
+            <select id="aaiModel">
+              <option value="">Universal-Streaming English（只识别英语）</option>
+              <option value="universal-streaming-multilingual">Universal-Streaming Multilingual（英 / 西 / 德 / 法 / 葡 / 意）</option>
+              <option value="universal-3-6-pro">Universal-3.6 Pro（32 种语言，可句内混说，价格约 3 倍）</option>
+            </select>
+          </label>
+          <p class="hint">音频会上传到 AssemblyAI 识别，断句也由它完成。下面的「识别语言」只对 Universal-3.6 Pro 起作用；English 模型只识别英语，意大利语的课请换另外两个模型。引擎、Key 和模型的改动在下一次「开始」生效。</p>
+        </div>
+        <p class="hint whisperOnly">本地 Whisper 模型在选中这一项后才加载（首次需下载约 1.6GB）。</p>
+      </div>
+
+      <div class="sect">
         <h3>语言</h3>
         <label class="field">识别语言
           <select id="asrLang">
@@ -173,7 +195,7 @@
         </label>
       </div>
 
-      <div class="sect">
+      <div class="sect whisperOnly">
         <h3>模型</h3>
         <label class="field">识别模型
           <select id="asrModel"><option value="">默认</option></select>
@@ -184,7 +206,7 @@
         <div class="row" id="asrVram"></div>
       </div>
 
-      <div class="sect">
+      <div class="sect whisperOnly">
         <h3>断句</h3>
         <label class="field">语音判定阈值 <input id="vadThr" type="number" step="0.05" min="0.1" max="0.95"></label>
         <label class="field">句末静音 (毫秒) <input id="vadSil" type="number" step="50" min="200" max="2000"></label>
@@ -197,8 +219,8 @@
         <label class="row"><input type="checkbox" id="asrGlossary"> 用术语表提示识别</label>
         <label class="field">识别提示语 <input id="asrHint" type="text" maxlength="150" placeholder="例如 Lezione di economia / Economics lecture"></label>
         <p class="hint">用讲课的语言写课程名称，提高专业词识别率；留空则不发送。</p>
-        <label class="row"><input type="checkbox" id="asrContext"> 用上一句作为上下文</label>
-        <p class="hint">把刚识别出的内容一起提示给 Whisper，前后用词、拼写更一致；发现同一句话被重复输出时可关掉。</p>
+        <label class="row whisperOnly"><input type="checkbox" id="asrContext"> 用上一句作为上下文</label>
+        <p class="hint whisperOnly">把刚识别出的内容一起提示给 Whisper，前后用词、拼写更一致；发现同一句话被重复输出时可关掉。</p>
       </div>
 
       <div class="sect">

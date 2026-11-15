@@ -3,8 +3,10 @@
 import sys
 import threading
 import types
+from contextlib import contextmanager
 
 import pytest
+from fastapi.testclient import TestClient
 
 import asr
 import server
@@ -188,9 +190,67 @@ def test_a_choice_made_while_a_model_is_loading_starts_no_second_load(fake):
         assert server.wanted_choice == [("large-v3", DEFAULT[1])]
 
 
-def test_gpu_endpoint(fake, monkeypatch):
-    from fastapi.testclient import TestClient
+# ---------------------------------------------------------------- loaded only when needed
 
+
+@pytest.fixture
+def idle(fake, monkeypatch):
+    """Nothing loaded yet, as when the backend has just started; `starts` lists the loads begun."""
+    fake.status, fake.model, fake.choice = "idle", None, None
+    starts = []
+
+    def load():
+        starts.append(server.wanted_choice[0])
+        fake.status = "loading"
+
+    monkeypatch.setattr(server, "load_model_in_background", load)
+    return starts
+
+
+@contextmanager
+def connected():
+    """A /ws connection that has sent nothing yet (session() sends settings and a start)."""
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as client, client.websocket_connect("ws://127.0.0.1:8765/ws") as sock:
+        assert sock.receive_json()["model"] == "idle"
+        yield sock
+
+
+def handled(sock):
+    """Wait until everything sent so far was handled: a stop is always answered with a "vad"."""
+    sock.send_json({"type": "stop"})
+    return read_until(sock, lambda m: m["type"] == "vad")
+
+
+def test_whisper_is_not_loaded_at_startup_or_for_assemblyai(idle):
+    with connected() as sock:
+        choose(sock, engine="assemblyai", model="large-v3")
+        handled(sock)
+        assert idle == []
+        assert server.status_message()["model"] == "idle"
+        # The model chosen meanwhile is remembered for when the local engine is chosen.
+        assert server.wanted_choice == [("large-v3", DEFAULT[1])]
+
+
+def test_choosing_the_local_engine_loads_the_chosen_model_once(idle):
+    with connected() as sock:
+        choose(sock, engine="assemblyai")
+        choose(sock, engine="local", model="large-v3")
+        assert read_until(sock, lambda m: m["type"] == "status")[-1]["model"] == "loading"
+        choose(sock, engine="local", model="large-v3")  # the page resends its settings often
+        sock.send_json({"type": "start", "run": 1})
+        handled(sock)
+        assert idle == [("large-v3", DEFAULT[1])]
+
+
+def test_a_start_without_settings_loads_whisper(idle):
+    """A script that never sends its settings gets the local engine."""
+    with connected() as sock:
+        sock.send_json({"type": "start", "run": 1})
+        read_until(sock, lambda m: m["type"] == "status" and m["model"] == "loading")
+        assert idle == [DEFAULT]
+
+
+def test_gpu_endpoint(fake, monkeypatch):
     with TestClient(server.app, base_url="http://127.0.0.1:8765") as client:
         monkeypatch.setattr(server, "gpu_memory", lambda: (3000, 8188))
         assert client.get("/api/gpu").json() == {"used_mb": 3000, "total_mb": 8188}
