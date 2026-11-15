@@ -305,6 +305,8 @@ def test_formatted_models_end_a_turn_twice_and_report_it_once(hub):
 
     events = run_stream(hub, ENGLISH, "it_en", [], body)
     assert [(e["index"], e["text"]) for e in kinds(events, "partial")] == [(1, "hello"), (1, "hello world")]
+    # Where the newest word of each partial ends, for the page's delay display.
+    assert [e["end"] for e in kinds(events, "partial")] == [0.06, 0.15]
     assert kinds(events, "final") == [{
         "kind": "final", "index": 1, "text": "Hello world.", "start": 0.02,
         "duration": pytest.approx(0.13), "lang": "en", "lang_prob": 1.0,
@@ -492,6 +494,7 @@ def test_a_cloud_run_goes_to_assemblyai_and_not_to_whisper(fake, hub):
         seen = read_until(sock, lambda m: m["type"] == "segment")
         assert [m["state"] for m in seen if m["type"] == "engine"] == ["connecting", "ready"]
         assert [(m["index"], m["text"]) for m in seen if m["type"] == "partial"] == [(1, "hello")]
+        assert [m["audio_end"] for m in seen if m["type"] == "partial"] == [0.06]
         assert seen[-1] == {
             "type": "segment", "index": 1, "start": 0.02, "duration": 0.13, "lang": "en", "lang_prob": 1.0,
             "text": "Hello world.", "asr_ms": 0, "merged": 1, "run": 1, "committed": 2400, "committed_run": 1,
