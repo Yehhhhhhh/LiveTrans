@@ -85,6 +85,7 @@ button.mini { padding: 2px 6px; }
 .seg .meta { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .seg .lang { font-weight: 600; padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); }
 .seg .lang.it { color: #059669; }
+.seg .lag { font-size: 11px; opacity: 0.75; font-variant-numeric: tabular-nums; }
 .seg .lang.en { color: #2563eb; }
 .seg .orig { font-size: var(--orig-size); color: var(--muted); line-height: 1.5; }
 .seg .trans { font-size: var(--trans-size); line-height: 1.5; margin-top: 2px; }

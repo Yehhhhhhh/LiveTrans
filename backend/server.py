@@ -514,7 +514,10 @@ async def ws_audio(ws: WebSocket) -> None:
             return
         if kind == "partial":
             if opts["partial"] and current and ev["index"] > live["final_sent"]:
-                await ws.send_json({"type": "partial", "index": ev["index"], "text": ev["text"]})
+                out = {"type": "partial", "index": ev["index"], "text": ev["text"]}
+                if ev.get("end") is not None:
+                    out["audio_end"] = round(bases.get(s.run, 0) / 16000 + ev["end"], 3)
+                await ws.send_json(out)
         elif kind == "drop":
             if current:
                 await ws.send_json({"type": "partial_drop", "index": ev["index"]})
@@ -672,14 +675,16 @@ async def ws_audio(ws: WebSocket) -> None:
         with lang_lock:
             return text if mode_gen[0] == gen else ""
 
-    async def run_partial(audio, index: int) -> None:
+    async def run_partial(audio, index: int, audio_end: float) -> None:
+        # audio_end: the stream position (seconds) of the newest audio in `audio`; the page shows
+        # how long after sending that audio its text came back.
         try:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
                 text = await to_thread_to_end(partial_job, audio, index)
             if text and index > live["final_sent"]:
-                await ws.send_json({"type": "partial", "index": index, "text": text})
+                await ws.send_json({"type": "partial", "index": index, "text": text, "audio_end": audio_end})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
             log.debug("Partial transcription failed", exc_info=True)
         finally:
@@ -699,7 +704,8 @@ async def ws_audio(ws: WebSocket) -> None:
         live["busy"] = True
         live["last_frame"] = seg.frames_seen
         # The event loop only keeps weak references to tasks: hold one until it is done.
-        t = asyncio.create_task(run_partial(audio, seg.index))
+        audio_end = round((bases.get(run[0], 0) + seg.frames_seen * FRAME) / 16000, 3)
+        t = asyncio.create_task(run_partial(audio, seg.index, audio_end))
         partial_tasks.add(t)
         t.add_done_callback(partial_tasks.discard)
 

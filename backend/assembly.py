@@ -394,7 +394,10 @@ class AssemblyStream:
             text = " ".join(str(w.get("text") or "").strip() for w in words).strip() or text
         if text:
             self._open = {"index": index, "text": text, "words": words}
-            await self._emit(kind="partial", index=index, text=text)
+            # "end": where the newest word ends (seconds of this stream's audio), so the page can
+            # tell how long ago the audio behind this text was sent.
+            end = self._session_start / 16000 + float(words[-1].get("end") or 0) / 1000 if words else None
+            await self._emit(kind="partial", index=index, text=text, end=end)
 
     async def _final(self, index: int, text: str, words: list, msg: dict) -> None:
         self._open = None
