@@ -123,10 +123,16 @@ function showVad(msg) {
 
 // Time of the last final transcription, plus the backlog once the GPU falls behind the speaker
 // (pending counts the segment being transcribed, so 1 is normal).
-const asrStat = { ms: null, merged: 1, pending: 0 };
+// `lag`: how long after the sentence was spoken its subtitle appeared (see onSegment).
+const asrStat = { ms: null, lag: null, merged: 1, pending: 0 };
+const fmtLag = (ms) => `${(ms / 1000).toFixed(1)} s`;
 function showAsr() {
   const el = $('stAsr');
-  let text = asrStat.ms == null ? '识别：-' : `识别：${asrStat.ms} ms`;
+  // AssemblyAI reports no computation time (asr_ms is 0): only the delay is shown.
+  const parts = [];
+  if (asrStat.ms) parts.push(`${asrStat.ms} ms`);
+  if (asrStat.lag != null) parts.push(`延迟 ${fmtLag(asrStat.lag)}`);
+  let text = asrStat.ms == null ? '识别：-' : `识别：${parts.join(' · ') || '0 ms'}`;
   if (asrStat.merged > 1) text += ` · 合并 ${asrStat.merged} 段追赶`;
   const behind = asrStat.pending >= 2;
   if (behind) text += ` · 待识别 ${asrStat.pending} 段`;
@@ -134,7 +140,7 @@ function showAsr() {
   setPill(el, text, warn ? 'warn' : asrStat.ms == null ? '' : 'ok');
   el.title = warn
     ? '识别速度跟不上说话速度，字幕会滞后。积压时自动把排队的几段合并成一次识别来追赶进度（自动语种时合并的几段共用一个语种）。经常出现可在「设置 → 识别」关闭逐词实时显示，或换用更小的模型。'
-    : '';
+    : '延迟：从这句话说完到字幕出现的时间（包含等待句末停顿、识别和网络传输）。';
 }
 
 // Messages pop up as a toast at the top centre. They fade after a while, except the
@@ -622,6 +628,10 @@ async function onSegment(msg) {
   const sentences = splitSentences(text);
   const total = sentences.reduce((n, s) => n + s.length, 0);
   let offset = 0;
+  // When the segment's last word was spoken, on the wall clock, and how long ago that is: the
+  // delay of this subtitle (waiting for the end of the sentence + recognition + network).
+  const heardAt = wall + (msg.start + msg.duration) * 1000;
+  const asrLag = Math.max(0, Math.round(Date.now() - heardAt));
   const segs = sentences.map((s) => {
     const seg = {
       id: crypto.randomUUID(),
@@ -632,16 +642,21 @@ async function onSegment(msg) {
       translation: '',
       trStatus: settings.tr.enabled ? 'pending' : 'off',
       error: '',
+      heardAt,
+      asrLag,
     };
     offset += s.length;
     return seg;
   });
   asrStat.ms = msg.asr_ms;
+  asrStat.lag = asrLag;
   asrStat.merged = msg.merged || 1;
   showAsr();
   if (settings.tr.enabled && current) takeLive(segs, msg.index);
+  // Translated while it was being spoken: the translation is there as soon as the subtitle is.
+  for (const s of segs) if (s.trStatus === 'done') s.trLag = asrLag;
   if (segs.some((s) => s.trStatus === 'done')) {
-    setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
+    setPill($('stTr'), `翻译：说话时已完成 · 延迟 ${fmtLag(asrLag)} · 队列 ${state.trQueue.length}`, 'ok');
   }
   let prev = current ? partialEl(msg.index) : null;
   segs.forEach((seg, i) => {
@@ -650,7 +665,7 @@ async function onSegment(msg) {
   });
   for (const seg of segs) {
     await db.putSegment(seg);
-    if (seg.trStatus === 'pending') enqueueTranslation(seg);
+    if (seg.trStatus === 'pending') enqueueTranslation(seg, true);
   }
 }
 
@@ -668,7 +683,13 @@ function splitSentences(text) {
   return out;
 }
 
-function enqueueTranslation(seg) {
+// Segments whose translation was requested as they arrived: only for these is the translation's
+// delay measured (a 重译 or a manual 翻译 later says nothing about the live delay).
+const timedSegs = new WeakSet();
+
+function enqueueTranslation(seg, timed = false) {
+  if (timed) timedSegs.add(seg);
+  else timedSegs.delete(seg);
   seg.trStatus = 'pending';
   seg.error = '';
   renderSeg(seg);
@@ -779,12 +800,19 @@ async function translateSeg(seg) {
     seg.trStatus = 'done';
     clearTrMsg();
     const total = Math.round(performance.now() - t0);
-    setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms · 队列 ${state.trQueue.length}`, 'ok');
+    let lag = '';
+    if (timedSegs.has(seg) && seg.heardAt) {
+      seg.trLag = Math.max(0, Math.round(Date.now() - seg.heardAt));
+      lag = ` · 延迟 ${fmtLag(seg.trLag)}`;
+    }
+    setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms${lag} · 队列 ${state.trQueue.length}`, 'ok');
+    $('stTr').title = '延迟：从这句话说完到译文出现的时间。';
   } catch (e) {
     seg.trStatus = 'error';
     seg.error = e.message;
     setPill($('stTr'), '翻译：失败', 'err');
   }
+  timedSegs.delete(seg);
   drafts.delete(seg.id);
   renderSeg(seg);
   await db.putSegment(seg);
@@ -997,7 +1025,7 @@ function renderSeg(seg, replace = null, after = null) {
     el = document.createElement('div');
     el.className = 'seg';
     el.dataset.id = seg.id;
-    el.innerHTML = `<div class="meta"><span class="time"></span><span class="lang"></span></div>
+    el.innerHTML = `<div class="meta"><span class="time"></span><span class="lang"></span><span class="lag"></span></div>
       <div class="orig"></div><div class="trans"></div>`;
     if (replace) replace.replaceWith(el);
     else if (after) after.after(el);
@@ -1008,6 +1036,12 @@ function renderSeg(seg, replace = null, after = null) {
   lang.textContent = (seg.lang || '?').toUpperCase();
   lang.className = `lang ${seg.lang || ''}`;
   el.querySelector('.orig').textContent = seg.text;
+  // Delay of the subtitle and of its translation, counted from the end of the spoken sentence.
+  const lag = el.querySelector('.lag');
+  lag.textContent = seg.asrLag == null
+    ? ''
+    : `延迟 ${fmtLag(seg.asrLag)}${seg.trLag == null ? '' : ` · 译文 ${fmtLag(seg.trLag)}`}`;
+  lag.title = seg.asrLag == null ? '' : '从这句话说完，到字幕 / 译文出现所用的时间';
 
   const tr = el.querySelector('.trans');
   tr.className = 'trans';
