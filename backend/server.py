@@ -343,6 +343,9 @@ MERGE_MAX_S = 24.0  # stay well inside Whisper's 30 s window
 MERGE_GAP_S = 0.3  # silence between merged segments, so Whisper sees the pause
 # While the Whisper model is still loading, queued speech waits; status is checked this often.
 MODEL_WAIT_POLL_S = 0.2
+# An AssemblyAI connection opened when 开始 was pressed is closed again if no capture has started
+# after this long (the window picker was left open): an open session is billed.
+SPARE_KEEP_S = 60.0
 # A failed final transcription is retried this many times in all, this long apart, before its
 # audio is given up (and stops being kept for resending, see ws_audio).
 TRANSCRIBE_ATTEMPTS = 3
@@ -432,6 +435,30 @@ async def ws_audio(ws: WebSocket) -> None:
     # is one of them, so its audio goes to the stream and not through the VAD to Whisper.
     streams: dict[int, assembly.AssemblyStream] = {}
     cloud = [False]
+    # A stream opened ahead of its run ("prepare": the page is about to start capturing), so that
+    # the connection is there when the audio begins. Audio that waits for the connection is sent
+    # at the speed it was captured at, and the whole run's results would stay that far behind.
+    # Its run is 0 until a "start" takes it. "state": its last reported state.
+    spare: dict = {"stream": None, "state": "", "timer": None}
+
+    def drop_spare() -> None:
+        s, timer = spare["stream"], spare["timer"]
+        spare.update(stream=None, state="", timer=None)
+        if timer:
+            timer.cancel()
+        if s:
+            s.close()  # ends the session properly: an open one is billed
+
+    def take_spare(key: str, model: str) -> assembly.AssemblyStream | None:
+        """The prepared stream, if it fits the run that starts now and is still good."""
+        s, state = spare["stream"], spare["state"]
+        if s and not s.done and not s.dead and state != "error" and (s.key, s.model) == (key, model):
+            spare["stream"] = None  # kept open: drop_spare only clears the rest
+            drop_spare()
+            return s
+        drop_spare()
+        return None
+
     # What the last answered segment said, in which language, and when (seconds, on the same clock
     # as a result's "start") it ended. Used as context for the next segment of the same run.
     ctx = {"text": "", "lang": "", "run": 0, "end": 0.0}
@@ -480,6 +507,11 @@ async def ws_audio(ws: WebSocket) -> None:
         """An AssemblyAI stream's events, as the messages the page knows from the Whisper path."""
         current = s.run == run[0]  # an older run's indices mean nothing for the current one
         kind = ev["kind"]
+        if not s.run:
+            # Opened ahead of its run and not taken (yet): the page hears of it when it is.
+            if s is spare["stream"] and kind == "state":
+                spare["state"] = ev["state"]
+            return
         if kind == "partial":
             if opts["partial"] and current and ev["index"] > live["final_sent"]:
                 out = {"type": "partial", "index": ev["index"], "text": ev["text"]}
@@ -756,6 +788,25 @@ async def ws_audio(ws: WebSocket) -> None:
                         await need_whisper()
                     if run[0] in streams:  # language or glossary changed while capturing
                         streams[run[0]].update(opts["language"], assembly.keyterms(opts["prompt"]))
+                elif kind == "prepare":
+                    # 开始 was pressed: the page now asks for its audio sources (a window picker,
+                    # a permission prompt), and "start" follows once it has them. Connect meanwhile.
+                    drop_spare()
+                    key = data.get("assemblyai_key")
+                    key = key.strip() if isinstance(key, str) else opts["key"]
+                    ai_model = assembly.normalize_model(data.get("assemblyai_model")) or opts["ai_model"]
+                    if data.get("engine") == "assemblyai" and key:
+                        stream = assembly.AssemblyStream(
+                            key, ai_model, opts["language"],
+                            assembly.keyterms(opts["prompt"]), on_stream,
+                        )
+                        spare.update(
+                            stream=stream,
+                            timer=asyncio.get_running_loop().call_later(SPARE_KEEP_S, drop_spare),
+                        )
+                        stream.start()
+                elif kind == "unprepare":  # no sources after all
+                    drop_spare()
                 elif kind in ("start", "resume"):
                     # "resume": a reconnecting page continues its stream at `offset` and resends
                     # the audio from there; segment start times continue from that position.
@@ -779,7 +830,18 @@ async def ws_audio(ws: WebSocket) -> None:
                     key = key.strip() if isinstance(key, str) else opts["key"]
                     ai_model = assembly.normalize_model(data.get("assemblyai_model")) or opts["ai_model"]
                     cloud[0] = engine == "assemblyai"
-                    if cloud[0]:
+                    spare_state = spare["state"]
+                    stream = take_spare(key, ai_model) if cloud[0] and kind == "start" else drop_spare()
+                    if stream:
+                        # Connected (or connecting) since "prepare": the settings may have changed.
+                        stream.run = run[0]
+                        streams[run[0]] = stream
+                        stream.update(opts["language"], assembly.keyterms(opts["prompt"]))
+                        await ws.send_json({
+                            "type": "engine", "state": spare_state or "connecting",
+                            "model": stream.model, "run": stream.run,
+                        })
+                    elif cloud[0]:
                         stream = assembly.AssemblyStream(
                             key, ai_model, opts["language"],
                             assembly.keyterms(opts["prompt"]), on_stream,
@@ -819,6 +881,10 @@ async def ws_audio(ws: WebSocket) -> None:
             t.cancel()
         for stream in streams.values():
             stream.abort()
+        if spare["timer"]:
+            spare["timer"].cancel()
+        if spare["stream"]:
+            spare["stream"].abort()
 
 
 class NoCacheStaticFiles(StaticFiles):

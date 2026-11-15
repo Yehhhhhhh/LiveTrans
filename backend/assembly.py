@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from urllib.parse import urlencode
@@ -29,14 +30,31 @@ DEFAULT_MODEL = ENGLISH
 
 # Audio goes out in chunks of this size (the API accepts 20-1000 ms per message).
 CHUNK_BYTES = 1600  # 50 ms of 16 kHz PCM16
+def _speed() -> float:
+    try:
+        return max(1.0, float(os.environ.get("LIVETRANS_AAI_SPEED") or 1.0))
+    except ValueError:
+        return 1.0
+
+
 # Audio must reach AssemblyAI no faster than it was captured: sent faster, it is transcribed
-# worse or the session is closed. Audio that queued up (while connecting, or kept for a new
-# session after the connection dropped) therefore goes out at this speed too, and the results
-# stay that much behind until the capture is stopped. SPEED: seconds of audio per second.
-SPEED = 1.0
+# worse or the session is closed (error 3007). Audio that queued up before the session began
+# (while connecting, or kept for a new session after the connection dropped) therefore goes out
+# at this speed too, and the results stay that much behind until the capture is stopped.
+# SPEED: seconds of audio per second. LIVETRANS_AAI_SPEED sets it for trying out a faster
+# catch-up (e.g. 1.1): AssemblyAI states no tolerance, so anything above 1 is at one's own risk.
+SPEED = _speed()
 # The sender may run ahead of that schedule by this much audio, to make up for its own late
 # wake-ups. Well within the API's limit: one message may carry up to a second of audio.
 BURST_S = 0.2
+# Audio captured while the session was open cannot add up to more than the session's age, however
+# late it is sent. So time during which nothing was waiting to be sent is kept as credit, up to
+# this much audio: what queues up later (a stalled page, a late wake-up) then goes out at once
+# instead of staying behind for the rest of the run.
+MAX_BURST_S = 1.0
+# The sender reports how far behind the capture it is, this often, while it is this far behind.
+BEHIND_LOG_EVERY_S = 10.0
+BEHIND_LOG_MIN_S = 0.2
 # Audio is kept until it is committed (see AssemblyStream.committed), so that a new session can
 # be given it again after the connection to AssemblyAI drops. At most this much.
 KEEP_S = 120
@@ -294,6 +312,7 @@ class AssemblyStream:
         self._pending = {}
         self._terminate_sent = False
         self._begun = asyncio.Event()
+        t0 = time.monotonic()
         async with open_socket(stream_url(self.model, self.language), self.key) as ws:
             sender = asyncio.create_task(self._send(ws))
             try:
@@ -302,6 +321,12 @@ class AssemblyStream:
                     msg = json.loads(await asyncio.wait_for(ws.recv(), timeout))
                     kind = msg.get("type")
                     if kind == "Begin":
+                        # Audio waiting now was captured before the session: it is sent at the
+                        # speed it was captured at, and the results stay this far behind.
+                        log.info(
+                            "AssemblyAI session ready after %.2f s, %.2f s of audio waiting",
+                            time.monotonic() - t0, (self.fed - self._session_start) / 16000,
+                        )
                         self._begun.set()
                         await self._emit(kind="state", state="ready")
                     elif kind == "Turn":
@@ -319,6 +344,8 @@ class AssemblyStream:
         if self.terms:
             await ws.send(json.dumps({"type": "UpdateConfiguration", "keyterms_prompt": self.terms}))
         next_at = 0.0  # on time.monotonic(): the next chunk is not sent before this (see SPEED)
+        begun = time.monotonic()
+        behind, behind_at = 0.0, begun  # the furthest behind the capture since the last report
         while True:
             if self._pending:
                 change, self._pending = self._pending, {}
@@ -332,8 +359,16 @@ class AssemblyStream:
                 pos, chunk = self._chunks[self._sent_count]
                 self._sent_count += 1
                 await ws.send(chunk)
-                next_at = max(next_at, time.monotonic() - BURST_S / SPEED) + len(chunk) / 32000 / SPEED
+                now = time.monotonic()
+                # How far ahead of the schedule this chunk may have been (see MAX_BURST_S).
+                credit = min(MAX_BURST_S, BURST_S + (now - begun) * SPEED)
+                next_at = max(next_at, now - credit / SPEED) + len(chunk) / 32000 / SPEED
                 self._sent_pos = pos + len(chunk) // 2
+                behind = max(behind, (self.fed - self._sent_pos) / 16000)
+                if now - behind_at >= BEHIND_LOG_EVERY_S:
+                    if behind >= BEHIND_LOG_MIN_S:
+                        log.info("AssemblyAI: sending was up to %.2f s behind the capture", behind)
+                    behind, behind_at = 0.0, now
                 if self._open is None:
                     self._commit(self._sent_pos - round(SILENCE_MARGIN_S * 16000))
                 continue

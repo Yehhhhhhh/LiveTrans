@@ -1410,12 +1410,25 @@ async function start() {
     return;
   }
   showMsg('');
+  // The backend connects to AssemblyAI while the sources are being asked for (the window picker,
+  // a permission prompt): audio that had to wait for the connection would keep the whole run's
+  // subtitles that far behind.
+  const cloud = settings.asr.engine === 'assemblyai';
+  if (cloud) {
+    wsSend({
+      type: 'prepare',
+      engine: settings.asr.engine,
+      assemblyai_key: settings.asr.assemblyKey,
+      assemblyai_model: settings.asr.assemblyModel,
+    });
+  }
   const src = settings.source;
   const acquired = [];
   try {
     for (const kind of wantedKinds(src)) acquired.push({ kind, stream: await acquire(kind) });
   } catch (e) {
     acquired.forEach((a) => stopStream(a.stream));
+    if (cloud) wsSend({ type: 'unprepare' });
     showMsg(acquireError(e));
     return;
   }
