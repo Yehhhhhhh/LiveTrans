@@ -123,24 +123,35 @@ function showVad(msg) {
 
 // Time of the last final transcription, plus the backlog once the GPU falls behind the speaker
 // (pending counts the segment being transcribed, so 1 is normal).
-// `lag`: how long after the sentence was spoken its subtitle appeared (see onSegment).
+// `lag`: how long after a piece of audio was sent its text came back (see audioLag).
 const asrStat = { ms: null, lag: null, merged: 1, pending: 0 };
-const fmtLag = (ms) => `${(ms / 1000).toFixed(1)} s`;
+const fmtLag = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+// Audio is sent as it is captured, so the audio at `audioEnd` (seconds on a run's stream clock)
+// left the page at `wall + audioEnd`. A text that covers the audio up to there arrived now.
+const audioLag = (wall, audioEnd) => Math.max(0, Math.round(Date.now() - (wall + audioEnd * 1000)));
+// The delay of the newest partial transcript, and the segment it belongs to.
+let partialLag = { index: -1, lag: null };
+function notePartialLag(msg) {
+  if (typeof msg.audio_end !== 'number') return;
+  partialLag = { index: msg.index, lag: audioLag(state.streamStartWall, msg.audio_end) };
+  asrStat.lag = partialLag.lag;
+  showAsr();
+}
 function showAsr() {
   const el = $('stAsr');
   // AssemblyAI reports no computation time (asr_ms is 0): only the delay is shown.
   const parts = [];
   if (asrStat.ms) parts.push(`${asrStat.ms} ms`);
   if (asrStat.lag != null) parts.push(`延迟 ${fmtLag(asrStat.lag)}`);
-  let text = asrStat.ms == null ? '识别：-' : `识别：${parts.join(' · ') || '0 ms'}`;
+  let text = `识别：${parts.join(' · ') || (asrStat.ms == null ? '-' : '0 ms')}`;
   if (asrStat.merged > 1) text += ` · 合并 ${asrStat.merged} 段追赶`;
   const behind = asrStat.pending >= 2;
   if (behind) text += ` · 待识别 ${asrStat.pending} 段`;
   const warn = behind || asrStat.merged > 1;
-  setPill(el, text, warn ? 'warn' : asrStat.ms == null ? '' : 'ok');
+  setPill(el, text, warn ? 'warn' : parts.length || asrStat.ms != null ? 'ok' : '');
   el.title = warn
     ? '识别速度跟不上说话速度，字幕会滞后。积压时自动把排队的几段合并成一次识别来追赶进度（自动语种时合并的几段共用一个语种）。经常出现可在「设置 → 识别」关闭逐词实时显示，或换用更小的模型。'
-    : '延迟：从这句话说完到字幕出现的时间（包含等待句末停顿、识别和网络传输）。';
+    : '延迟：音频发送出去，到收到它对应的文字所用的时间。';
 }
 
 // Messages pop up as a toast at the top centre. They fade after a while, except the
@@ -404,6 +415,7 @@ function connectWs() {
     else if (msg.type === 'vad') showVad(msg);
     else if (msg.type === 'segment') onSegment(msg);
     else if (msg.type === 'partial') {
+      notePartialLag(msg);
       renderPartial(msg.index, msg.text);
       liveTranslate(msg.index, msg.text);
     } else if (msg.type === 'partial_drop') {
@@ -430,6 +442,7 @@ function connectWs() {
 function startRun() {
   state.run += 1;
   state.streamStartWall = Date.now();
+  partialLag = { index: -1, lag: null }; // indices start over with the run
   state.runWall.set(state.run, state.streamStartWall);
   for (const r of state.runWall.keys()) if (r < state.run - 20) state.runWall.delete(r);
   runEngine.set(state.run, {
@@ -628,10 +641,13 @@ async function onSegment(msg) {
   const sentences = splitSentences(text);
   const total = sentences.reduce((n, s) => n + s.length, 0);
   let offset = 0;
-  // When the segment's last word was spoken, on the wall clock, and how long ago that is: the
-  // delay of this subtitle (waiting for the end of the sentence + recognition + network).
-  const heardAt = wall + (msg.start + msg.duration) * 1000;
-  const asrLag = Math.max(0, Math.round(Date.now() - heardAt));
+  // Recognition delay: audio sent -> its text received. The segment's last partial measured
+  // exactly that; the final result also waited for the end of the sentence to be detected, so
+  // it only counts for a segment that had no partial.
+  const asrLag =
+    current && partialLag.index === msg.index && partialLag.lag != null
+      ? partialLag.lag
+      : audioLag(wall, msg.start + msg.duration);
   const segs = sentences.map((s) => {
     const seg = {
       id: crypto.randomUUID(),
@@ -642,7 +658,6 @@ async function onSegment(msg) {
       translation: '',
       trStatus: settings.tr.enabled ? 'pending' : 'off',
       error: '',
-      heardAt,
       asrLag,
     };
     offset += s.length;
@@ -653,10 +668,8 @@ async function onSegment(msg) {
   asrStat.merged = msg.merged || 1;
   showAsr();
   if (settings.tr.enabled && current) takeLive(segs, msg.index);
-  // Translated while it was being spoken: the translation is there as soon as the subtitle is.
-  for (const s of segs) if (s.trStatus === 'done') s.trLag = asrLag;
   if (segs.some((s) => s.trStatus === 'done')) {
-    setPill($('stTr'), `翻译：说话时已完成 · 延迟 ${fmtLag(asrLag)} · 队列 ${state.trQueue.length}`, 'ok');
+    setPill($('stTr'), `翻译：说话时已完成 · 队列 ${state.trQueue.length}`, 'ok');
   }
   let prev = current ? partialEl(msg.index) : null;
   segs.forEach((seg, i) => {
@@ -665,7 +678,7 @@ async function onSegment(msg) {
   });
   for (const seg of segs) {
     await db.putSegment(seg);
-    if (seg.trStatus === 'pending') enqueueTranslation(seg, true);
+    if (seg.trStatus === 'pending') enqueueTranslation(seg);
   }
 }
 
@@ -683,13 +696,7 @@ function splitSentences(text) {
   return out;
 }
 
-// Segments whose translation was requested as they arrived: only for these is the translation's
-// delay measured (a 重译 or a manual 翻译 later says nothing about the live delay).
-const timedSegs = new WeakSet();
-
-function enqueueTranslation(seg, timed = false) {
-  if (timed) timedSegs.add(seg);
-  else timedSegs.delete(seg);
+function enqueueTranslation(seg) {
   seg.trStatus = 'pending';
   seg.error = '';
   renderSeg(seg);
@@ -779,7 +786,8 @@ async function translateSeg(seg) {
   // A live request already translating exactly this text is taken over rather than restarted.
   const req = adopted.get(seg.id);
   adopted.delete(seg.id);
-  const t0 = performance.now();
+  // An adopted request was sent earlier: its delay counts from then.
+  const t0 = req ? req.t0 : performance.now();
   let first = 0;
   const onText = (text) => {
     if (!first) first = performance.now() - t0;
@@ -800,19 +808,14 @@ async function translateSeg(seg) {
     seg.trStatus = 'done';
     clearTrMsg();
     const total = Math.round(performance.now() - t0);
-    let lag = '';
-    if (timedSegs.has(seg) && seg.heardAt) {
-      seg.trLag = Math.max(0, Math.round(Date.now() - seg.heardAt));
-      lag = ` · 延迟 ${fmtLag(seg.trLag)}`;
-    }
-    setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms${lag} · 队列 ${state.trQueue.length}`, 'ok');
-    $('stTr').title = '延迟：从这句话说完到译文出现的时间。';
+    seg.trMs = total; // translation delay: text sent -> translation received
+    setPill($('stTr'), `翻译：首字 ${Math.round(first || total)} ms · 共 ${total} ms · 队列 ${state.trQueue.length}`, 'ok');
+    $('stTr').title = '从文字发送出去翻译，到收到第一个字 / 完整译文所用的时间。';
   } catch (e) {
     seg.trStatus = 'error';
     seg.error = e.message;
     setPill($('stTr'), '翻译：失败', 'err');
   }
-  timedSegs.delete(seg);
   drafts.delete(seg.id);
   renderSeg(seg);
   await db.putSegment(seg);
@@ -829,6 +832,7 @@ const newLive = (index) => ({
   index,
   sentences: [],
   done: new Map(), // sentence text -> translation
+  ms: new Map(), // sentence text -> how long that translation took (sent -> received)
   failed: new Set(), // sentence texts not to retry; the final pass still follows
   shown: [], // per sentence position: the finished draft on screen
   req: null, // the draft translation request in flight
@@ -867,6 +871,7 @@ function pumpLive() {
   const text = live.sentences[pos];
   const req = {
     text,
+    t0: performance.now(),
     ctrl: new AbortController(),
     // Drafts never stream: each one appears whole and replaces the previous in one go.
     // (Replaced by the segment's handler if this request is adopted for a final sentence.)
@@ -881,6 +886,7 @@ function pumpLive() {
       (out) => {
         if (live.req !== req) return;
         live.done.set(liveKey(text), out);
+        live.ms.set(liveKey(text), Math.round(performance.now() - req.t0));
         live.shown[pos] = out;
         showLive();
       },
@@ -907,6 +913,7 @@ function takeLive(segs, index) {
     if (live.done.has(key)) {
       seg.translation = live.done.get(key);
       seg.trStatus = 'done';
+      seg.trMs = live.ms.get(key); // the delay of the live request that produced it
       return;
     }
     if (live.req && liveKey(live.req.text) === key) {
@@ -1036,12 +1043,13 @@ function renderSeg(seg, replace = null, after = null) {
   lang.textContent = (seg.lang || '?').toUpperCase();
   lang.className = `lang ${seg.lang || ''}`;
   el.querySelector('.orig').textContent = seg.text;
-  // Delay of the subtitle and of its translation, counted from the end of the spoken sentence.
+  // Delays: audio sent -> text received, and text sent for translation -> translation received.
   const lag = el.querySelector('.lag');
-  lag.textContent = seg.asrLag == null
-    ? ''
-    : `延迟 ${fmtLag(seg.asrLag)}${seg.trLag == null ? '' : ` · 译文 ${fmtLag(seg.trLag)}`}`;
-  lag.title = seg.asrLag == null ? '' : '从这句话说完，到字幕 / 译文出现所用的时间';
+  const lags = [];
+  if (seg.asrLag != null) lags.push(`识别 ${fmtLag(seg.asrLag)}`);
+  if (seg.trMs != null) lags.push(`翻译 ${fmtLag(seg.trMs)}`);
+  lag.textContent = lags.length ? `延迟 ${lags.join(' · ')}` : '';
+  lag.title = lags.length ? '识别：音频发送出去到收到文字的时间；翻译：文字发送出去到收到译文的时间' : '';
 
   const tr = el.querySelector('.trans');
   tr.className = 'trans';
