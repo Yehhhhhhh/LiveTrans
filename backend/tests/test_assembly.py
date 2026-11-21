@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 import assembly
 import server
-from assembly import ENGLISH, MULTILINGUAL, PRO, AssemblyStream
+from assembly import ENGLISH, MULTILINGUAL, PRO, STT37, AssemblyStream
 from test_ws_worker import FakeSegmenter, FakeTranscriber, read_until
 
 CHUNK = b"\0" * assembly.CHUNK_BYTES  # 50 ms
@@ -124,6 +124,7 @@ def test_default_model_is_universal_streaming_english():
     assert assembly.DEFAULT_MODEL == "universal-streaming-english"
     assert assembly.normalize_model("") == ENGLISH
     assert assembly.normalize_model(PRO) == PRO
+    assert assembly.normalize_model(STT37) == "assemblyai-stt-3-7-realtime"
 
 
 @pytest.mark.parametrize("value", [None, 3, "whisper", "universal-2", "../x"])
@@ -146,12 +147,18 @@ def test_url_of_each_model():
     }
     assert query(assembly.stream_url(PRO, "fr"))["language_codes"] == '["fr"]'
     assert "language_codes" not in query(assembly.stream_url(PRO, "any"))
+    # STT-3.7 Realtime is sent like Universal-3.6 Pro: always formatted, steered by language.
+    assert query(assembly.stream_url(STT37, "it_en")) == {
+        **common, "speech_model": STT37, "language_detection": "true", "language_codes": '["it", "en"]',
+    }
+    assert query(assembly.stream_url(STT37, "it"))["language_codes"] == '["it"]'
 
 
 def test_language_of_a_result_that_carries_none():
     assert assembly.fixed_language(ENGLISH, "it") == "en"
     assert assembly.fixed_language(PRO, "it") == "it"
     assert assembly.fixed_language(PRO, "it_en") == ""
+    assert assembly.fixed_language(STT37, "en") == "en"
 
 
 def test_keyterms_are_the_glossary_terms_within_the_limits():
@@ -313,7 +320,8 @@ def test_formatted_models_end_a_turn_twice_and_report_it_once(hub):
     }]
 
 
-def test_pro_model_reports_the_detected_language(hub):
+@pytest.mark.parametrize("model", [PRO, STT37])
+def test_steerable_models_end_a_turn_once_and_report_the_detected_language(hub, model):
     hub.scripts = [{
         2: [turn(0, "Buongiorno a tutti.", [("Buongiorno", 0, 50), ("tutti.", 60, 90)], end=True,
                  language_code="it", language_confidence=0.9234)],
@@ -324,7 +332,7 @@ def test_pro_model_reports_the_detected_language(hub):
         s.feed(CHUNK * 4)
         await until(lambda: len(kinds(events, "final")) == 2)
 
-    finals = kinds(run_stream(hub, PRO, "it_en", [], body), "final")
+    finals = kinds(run_stream(hub, model, "it_en", [], body), "final")
     assert [(e["index"], e["text"], e["lang"], e["lang_prob"]) for e in finals] == [
         (1, "Buongiorno a tutti.", "it", 0.923),
         (2, "Good morning.", "", 0.0),  # no language reported, and none fixed

@@ -498,6 +498,7 @@ const ASSEMBLY_LABELS = {
   '': 'Universal-Streaming English',
   'universal-streaming-multilingual': 'Universal-Streaming Multilingual',
   'universal-3-6-pro': 'Universal-3.6 Pro',
+  'assemblyai-stt-3-7-realtime': 'STT-3.7 Realtime',
 };
 let whisperStatus = null; // the backend's last 'status' message
 let engineState = ''; // of the current run's AssemblyAI stream: connecting | ready | error | ''

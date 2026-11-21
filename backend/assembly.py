@@ -24,8 +24,12 @@ URL = "wss://streaming.assemblyai.com/v3/ws"
 ENGLISH = "universal-streaming-english"  # English only; reports no language
 MULTILINGUAL = "universal-streaming-multilingual"  # en/es/de/fr/pt/it, one language per turn
 PRO = "universal-3-6-pro"  # 32 languages, switches within a sentence
+STT37 = "assemblyai-stt-3-7-realtime"  # 32 languages, switches within a sentence; for notetakers
+# Models whose turns always come formatted (they take no format_turns: each turn ends once) and
+# that can be steered toward the recognition languages (language_codes).
+STEERABLE = (PRO, STT37)
 # Only these names are ever sent: the name comes from the page.
-MODELS = (ENGLISH, MULTILINGUAL, PRO)
+MODELS = (ENGLISH, MULTILINGUAL, PRO, STT37)
 DEFAULT_MODEL = ENGLISH
 
 # Audio goes out in chunks of this size (the API accepts 20-1000 ms per message).
@@ -89,8 +93,9 @@ def keyterms(prompt: str) -> list[str]:
 
 def language_codes(model: str, language: object) -> list[str] | None:
     """Languages to steer the model toward, for the recognition-language setting; None = no
-    steering. Only Universal-3.6 Pro takes them: the other models choose by themselves."""
-    if model != PRO:
+    steering. Only Universal-3.6 Pro and STT-3.7 Realtime take them: the other models choose by
+    themselves."""
+    if model not in STEERABLE:
         return None
     mode = normalize_language(language) or IT_EN
     if mode == ANY:
@@ -109,7 +114,7 @@ def fixed_language(model: str, language: object) -> str:
 
 def stream_url(model: str, language: object) -> str:
     query = {"speech_model": model, "sample_rate": "16000", "encoding": "pcm_s16le"}
-    if model != PRO:
+    if model not in STEERABLE:
         # Punctuation and casing: each turn then ends twice, unformatted and then formatted.
         query["format_turns"] = "true"
     if model != ENGLISH:
@@ -385,7 +390,7 @@ class AssemblyStream:
         words = msg.get("words") or []
         text = (msg.get("transcript") or "").strip()
         # With format_turns a turn ends twice: unformatted first, then with punctuation.
-        final = bool(msg.get("end_of_turn")) and (self.model == PRO or bool(msg.get("turn_is_formatted")))
+        final = bool(msg.get("end_of_turn")) and (self.model in STEERABLE or bool(msg.get("turn_is_formatted")))
         if final:
             await self._final(index, text, words, msg)
             return
