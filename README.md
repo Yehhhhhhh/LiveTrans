@@ -137,7 +137,7 @@
 启用：
 
 1. 额外安装 PyTorch 版 Whisper（约 3GB）：`.venv\Scripts\python -m pip install -r backend\requirements-alignatt.txt`
-2. 重启后端，在「设置 → 识别 → 模型」选「large-v3-turbo · AlignAtt 同传（实验）」。第一次会下载 OpenAI 的模型文件（约 1.6GB，存在 `%USERPROFILE%\.cache\whisper`，可用 `LIVETRANS_WHISPER_PT_DIR` 改位置）。
+2. 重启后端，在「设置 → 识别 → 模型」选「large-v3-turbo · AlignAtt 同传（实验）」或「large-v3 · AlignAtt 同传（实验）」。第一次会下载 OpenAI 的模型文件（turbo 约 1.6GB，large-v3 约 3GB，存在 `%USERPROFILE%\.cache\whisper`，可用 `LIVETRANS_WHISPER_PT_DIR` 改位置）。
 
 说明：
 
