@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 import assembly
 import server
-from assembly import ENGLISH, MULTILINGUAL, PRO, AssemblyStream
+from assembly import AGENT, ENGLISH, MULTILINGUAL, STT37, AssemblyStream
 from test_ws_worker import FakeSegmenter, FakeTranscriber, read_until
 
 CHUNK = b"\0" * assembly.CHUNK_BYTES  # 50 ms
@@ -123,7 +123,9 @@ def query(url):
 def test_default_model_is_universal_streaming_english():
     assert assembly.DEFAULT_MODEL == "universal-streaming-english"
     assert assembly.normalize_model("") == ENGLISH
-    assert assembly.normalize_model(PRO) == PRO
+    assert assembly.normalize_model(AGENT) == "assemblyai-stt-3-7-realtime-agent"
+    assert assembly.normalize_model("universal-3-6-pro") is None  # no longer offered
+    assert assembly.normalize_model(STT37) == "assemblyai-stt-3-7-realtime"
 
 
 @pytest.mark.parametrize("value", [None, 3, "whisper", "universal-2", "../x"])
@@ -141,17 +143,23 @@ def test_url_of_each_model():
     assert query(assembly.stream_url(MULTILINGUAL, "it_en")) == {
         **common, "speech_model": MULTILINGUAL, "format_turns": "true", "language_detection": "true",
     }
-    assert query(assembly.stream_url(PRO, "it_en")) == {
-        **common, "speech_model": PRO, "language_detection": "true", "language_codes": '["it", "en"]',
+    assert query(assembly.stream_url(AGENT, "it_en")) == {
+        **common, "speech_model": AGENT, "language_detection": "true", "language_codes": '["it", "en"]',
     }
-    assert query(assembly.stream_url(PRO, "fr"))["language_codes"] == '["fr"]'
-    assert "language_codes" not in query(assembly.stream_url(PRO, "any"))
+    assert query(assembly.stream_url(AGENT, "fr"))["language_codes"] == '["fr"]'
+    assert "language_codes" not in query(assembly.stream_url(AGENT, "any"))
+    # Both STT-3.7 models: always formatted, steered by language.
+    assert query(assembly.stream_url(STT37, "it_en")) == {
+        **common, "speech_model": STT37, "language_detection": "true", "language_codes": '["it", "en"]',
+    }
+    assert query(assembly.stream_url(STT37, "it"))["language_codes"] == '["it"]'
 
 
 def test_language_of_a_result_that_carries_none():
     assert assembly.fixed_language(ENGLISH, "it") == "en"
-    assert assembly.fixed_language(PRO, "it") == "it"
-    assert assembly.fixed_language(PRO, "it_en") == ""
+    assert assembly.fixed_language(AGENT, "it") == "it"
+    assert assembly.fixed_language(AGENT, "it_en") == ""
+    assert assembly.fixed_language(STT37, "en") == "en"
 
 
 def test_keyterms_are_the_glossary_terms_within_the_limits():
@@ -313,7 +321,8 @@ def test_formatted_models_end_a_turn_twice_and_report_it_once(hub):
     }]
 
 
-def test_pro_model_reports_the_detected_language(hub):
+@pytest.mark.parametrize("model", [AGENT, STT37])
+def test_steerable_models_end_a_turn_once_and_report_the_detected_language(hub, model):
     hub.scripts = [{
         2: [turn(0, "Buongiorno a tutti.", [("Buongiorno", 0, 50), ("tutti.", 60, 90)], end=True,
                  language_code="it", language_confidence=0.9234)],
@@ -324,7 +333,7 @@ def test_pro_model_reports_the_detected_language(hub):
         s.feed(CHUNK * 4)
         await until(lambda: len(kinds(events, "final")) == 2)
 
-    finals = kinds(run_stream(hub, PRO, "it_en", [], body), "final")
+    finals = kinds(run_stream(hub, model, "it_en", [], body), "final")
     assert [(e["index"], e["text"], e["lang"], e["lang_prob"]) for e in finals] == [
         (1, "Buongiorno a tutti.", "it", 0.923),
         (2, "Good morning.", "", 0.0),  # no language reported, and none fixed
@@ -450,7 +459,7 @@ def test_language_and_glossary_changes_are_sent_while_capturing(hub):
         s.update("any", ["Fourier"])
         await until(lambda: len(hub.sockets[0].texts()) == 2)
 
-    run_stream(hub, PRO, "it_en", [], body)
+    run_stream(hub, AGENT, "it_en", [], body)
     assert hub.sockets[0].texts() == [
         {"type": "UpdateConfiguration", "language_codes": ["en"], "keyterms_prompt": ["Fourier"]},
         {"type": "UpdateConfiguration", "language_codes": []},
@@ -522,11 +531,11 @@ def test_partials_can_be_switched_off(fake, hub):
 
 
 def test_the_chosen_model_is_used_and_unknown_ones_are_not(fake, hub):
-    with cloud_session(assemblyai_model=PRO, language="it"):
+    with cloud_session(assemblyai_model=AGENT, language="it"):
         pass
     with cloud_session(assemblyai_model="whisper-9"):
         pass
-    assert [url for url, _ in hub.calls] == [assembly.stream_url(PRO, "it"), assembly.stream_url(ENGLISH, "it_en")]
+    assert [url for url, _ in hub.calls] == [assembly.stream_url(AGENT, "it"), assembly.stream_url(ENGLISH, "it_en")]
 
 
 def test_a_resumed_run_keeps_its_clock(fake, hub):
@@ -580,13 +589,13 @@ def test_a_resumed_run_keeps_the_engine_it_was_started_with(fake, hub):
 
 
 def test_a_resumed_cloud_run_keeps_its_key_and_model(fake, hub):
-    pinned = {"engine": "assemblyai", "assemblyai_key": "old key", "assemblyai_model": PRO}
+    pinned = {"engine": "assemblyai", "assemblyai_key": "old key", "assemblyai_model": AGENT}
     with TestClient(server.app, base_url="http://127.0.0.1:8765") as client, client.websocket_connect("ws://127.0.0.1:8765/ws") as sock:
         assert sock.receive_json()["type"] == "status"
         sock.send_json({"type": "config", "asr": {"engine": "local", "assemblyai_key": "new key", "language": "it"}})
         sock.send_json({"type": "resume", "run": 3, "offset": 0, **pinned})
         read_until(sock, lambda m: m["type"] == "engine" and m["state"] == "ready")
-    assert hub.calls == [(assembly.stream_url(PRO, "it"), "old key")]
+    assert hub.calls == [(assembly.stream_url(AGENT, "it"), "old key")]
     assert fake.calls == 0
 
 
