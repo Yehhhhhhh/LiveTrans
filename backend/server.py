@@ -47,9 +47,9 @@ COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
 # from the page, and a free one could point faster-whisper at any repository or local path.
 ASR_MODELS = tuple(dict.fromkeys((MODEL, "large-v3-turbo", "large-v3")))
 # The experimental AlignAtt engine (alignatt.py), offered once its packages are installed.
-ALIGNATT_MODEL = alignatt.PREFIX + "large-v3-turbo"
+ALIGNATT_MODELS = tuple(alignatt.PREFIX + m for m in ("large-v3-turbo", "large-v3"))
 if alignatt.available():
-    ASR_MODELS += (ALIGNATT_MODEL,)
+    ASR_MODELS += ALIGNATT_MODELS
 # Compute types (weight precision) it may choose. "auto" is float16 on a GPU and int8 on the CPU;
 # the int8 ones roughly halve the VRAM the weights take, at a small cost in accuracy.
 COMPUTE_TYPES = tuple(dict.fromkeys((COMPUTE_TYPE, "auto", "float16", "int8_float16", "int8")))

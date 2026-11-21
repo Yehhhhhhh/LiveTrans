@@ -28,6 +28,20 @@ def test_the_last_word_is_held_back():
     assert AlignAttModel.drop_last_word(FakeTok(), [4], [1])[0] == []
 
 
+def test_a_hard_cut_keeps_the_shown_words_before_it():
+    from alignatt import kept_prefix
+
+    tok = FakeTok()  # " The" " least" " squ" "ares" "," " est"
+    tokens = [0, 1, 2, 3, 4]
+    ends = [1000, 2000, 3000, 4000, 4100]
+    assert kept_prefix(tok, tokens, ends, 5000) == tokens  # all within the segment
+    # The cut falls inside "squares,": the whole word goes to the next segment, not half of it.
+    assert kept_prefix(tok, tokens, ends, 3500) == [0, 1]
+    assert kept_prefix(tok, tokens, ends, 4050) == [0, 1]
+    assert kept_prefix(tok, tokens, ends, 1500) == [0]
+    assert kept_prefix(tok, tokens, ends, 500) == []
+
+
 class Stats:
     def __init__(self, no_speech=0.0, logprob=-0.2, ratio=1.2):
         self.no_speech_prob, self.avg_logprob, self.compression_ratio = no_speech, logprob, ratio

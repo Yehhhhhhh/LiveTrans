@@ -54,6 +54,17 @@ SAMPLES_PER_FRAME = 320  # one encoder frame: 20 ms at 16 kHz
 # Loop guard: at most this many tokens per second of audio (plus a few), well above real speech.
 TOKENS_PER_S = 10
 TOKENS_BASE = 20
+# How far past the frame a token was attended at its word is taken to reach (0.24 s).
+END_MARGIN = FRAME_THRESHOLD // 2 * SAMPLES_PER_FRAME
+
+
+def kept_prefix(tok, tokens: list[int], ends: list[int], n_samples: int) -> list[int]:
+    """The shown tokens that lie within the segment's final audio of n_samples: up to the first
+    one reaching past its end, and then back to the start of that word, so no word is cut."""
+    k = next((i for i, e in enumerate(ends) if e > n_samples), len(tokens))
+    while 0 < k < len(tokens) and not tok.decode([tokens[k]]).startswith(" "):
+        k -= 1
+    return tokens[:k]
 
 
 def available() -> bool:
@@ -71,10 +82,10 @@ class StreamState:
 
     lang: str = ""
     tokens: list[int] = field(default_factory=list)  # words shown, as Whisper tokens
-    # Audio samples (from the segment's start) that the shown words were attended up to. If the
-    # final audio of the segment is shorter (a hard cut put the rest in the next segment), the
-    # shown words can't be kept as its start.
-    end: int = 0
+    # For each token: the audio sample (from the segment's start) it is taken to reach, i.e. where
+    # it was attended plus END_MARGIN. When a hard cut ends the segment earlier than that (the
+    # rest of the audio opens the next segment), the words from there on aren't kept (kept_prefix).
+    ends: list[int] = field(default_factory=list)
 
 
 def model_cache_dir() -> Path:
@@ -264,7 +275,7 @@ class AlignAttModel:
         (shown before) plus the new ones. Without a state, just this update's certain words."""
         state = state if state is not None else StreamState()
         if state.lang != lang:
-            state.lang, state.tokens, state.end = lang, [], 0
+            state.lang, state.tokens, state.ends = lang, [], []
         tok = self.tokenizer(lang)
         initial = fit_prompt(self.count_tokens, prompt) if prompt else ""
         feats, frames = self.encode(audio)
@@ -272,7 +283,11 @@ class AlignAttModel:
         new, where = self.drop_last_word(tok, new, where)
         if new and self._acceptable(tok, state.tokens, new, stats, prompt):
             state.tokens = state.tokens + new
-            state.end = (max(where) + FRAME_THRESHOLD // 2) * SAMPLES_PER_FRAME
+            # Kept non-decreasing: a word can't end before the words shown ahead of it.
+            last = state.ends[-1] if state.ends else 0
+            for frame in where:
+                last = max(last, frame * SAMPLES_PER_FRAME + END_MARGIN)
+                state.ends.append(last)
         return clean_text(tok.decode(state.tokens), prompt) if state.tokens else ""
 
     @staticmethod
@@ -305,8 +320,8 @@ class AlignAttModel:
         else:
             lang, lang_prob = self.detect(feats, detect_among(mode))
         forced = []
-        if state and state.tokens and state.lang == lang and state.end <= len(audio):
-            forced = state.tokens
+        if state and state.tokens and state.lang == lang:
+            forced = kept_prefix(self.tokenizer(lang), state.tokens, state.ends, len(audio))
         if context_lang != lang:
             context = ""
         initial = fit_prompt(self.count_tokens, prompt, context) if prompt or context else ""
