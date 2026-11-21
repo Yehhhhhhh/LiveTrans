@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from starlette.websockets import WebSocketState  # noqa: E402
 
+import alignatt  # noqa: E402
 import assembly  # noqa: E402
 from asr import IT_EN, Transcriber, all_languages, detect_among, is_fixed, normalize_language  # noqa: E402
 from guard import LocalOnlyMiddleware  # noqa: E402
@@ -45,6 +46,10 @@ COMPUTE_TYPE = os.environ.get("LIVETRANS_COMPUTE_TYPE", "auto")
 # Whisper models the page may choose in 设置 → 识别. Only these names are ever loaded: the name comes
 # from the page, and a free one could point faster-whisper at any repository or local path.
 ASR_MODELS = tuple(dict.fromkeys((MODEL, "large-v3-turbo", "large-v3")))
+# The experimental AlignAtt engine (alignatt.py), offered once its packages are installed.
+ALIGNATT_MODELS = tuple(alignatt.PREFIX + m for m in ("large-v3-turbo", "large-v3"))
+if alignatt.available():
+    ASR_MODELS += ALIGNATT_MODELS
 # Compute types (weight precision) it may choose. "auto" is float16 on a GPU and int8 on the CPU;
 # the int8 ones roughly halve the VRAM the weights take, at a small cost in accuracy.
 COMPUTE_TYPES = tuple(dict.fromkeys((COMPUTE_TYPE, "auto", "float16", "int8_float16", "int8")))
@@ -486,10 +491,17 @@ async def ws_audio(ws: WebSocket) -> None:
     # not be sent afterwards, or the line would come back and stay ("识别中…") with nothing to
     # replace it until the next sentence.
     gone: set[int] = set()
+    # AlignAtt engine only: (run, index) -> what its partials have shown of the segment in
+    # progress, which its final transcription keeps as its start (see alignatt.py).
+    shown: dict[tuple[int, int], alignatt.StreamState] = {}
+
+    def alignatt_on() -> bool:
+        return getattr(transcriber, "engine", None) is not None
 
     async def send_dropped() -> None:
         for index in seg.take_dropped():
             gone.add(index)
+            shown.pop((run[0], index), None)
             await ws.send_json({"type": "partial_drop", "index": index})
 
     def committed() -> int:
@@ -583,12 +595,15 @@ async def ws_audio(ws: WebSocket) -> None:
             context = (ctx["text"], ctx["lang"])
         # Answering a batch advances "committed", and the page then drops the kept audio. So a
         # failure (e.g. a transient CUDA error) is retried before the batch is given up.
+        args = [item.audio, opts["language"], opts["prompt"], *context]
+        states = [shown.pop((it.run, it.index), None) for it in items]
+        if alignatt_on():
+            # A merged batch is decoded afresh: its partials' words belong to one part of it.
+            args.append(states[0] if len(items) == 1 else None)
         for attempt in range(1, TRANSCRIBE_ATTEMPTS + 1):
             try:
                 async with gpu_lock:
-                    res = await to_thread_to_end(
-                        transcriber.transcribe, item.audio, opts["language"], opts["prompt"], *context
-                    )
+                    res = await to_thread_to_end(transcriber.transcribe, *args)
                 break
             except Exception as e:  # noqa: BLE001
                 log.exception("Transcription failed (attempt %d of %d)", attempt, TRANSCRIBE_ATTEMPTS)
@@ -598,6 +613,8 @@ async def ws_audio(ws: WebSocket) -> None:
                     return
                 await asyncio.sleep(TRANSCRIBE_RETRY_S)
         answered(items)
+        for it in items:  # a partial may have started again after the state was taken
+            shown.pop((it.run, it.index), None)
         if res["text"]:
             # Same language and still connected to it: keep the older text too, so a short
             # "Sì." doesn't leave the next segment with almost no context.
@@ -669,7 +686,7 @@ async def ws_audio(ws: WebSocket) -> None:
     mode_gen = [0]
     lang_lock = threading.Lock()
 
-    def partial_job(audio, index: int) -> str:
+    def partial_job(audio, index: int, started_in: int) -> str:
         with lang_lock:
             gen, lang = mode_gen[0], opts["language"]
             cached = live["lang"] if live["lang_index"] == index else ""
@@ -682,7 +699,11 @@ async def ws_audio(ws: WebSocket) -> None:
                     with lang_lock:
                         if mode_gen[0] == gen:
                             live["lang_index"], live["lang"] = index, lang
-        text = transcriber.transcribe_partial(audio, lang, opts["prompt"])
+        if alignatt_on():
+            state = shown.setdefault((started_in, index), alignatt.StreamState())
+            text = transcriber.transcribe_partial(audio, lang, opts["prompt"], state)
+        else:
+            text = transcriber.transcribe_partial(audio, lang, opts["prompt"])
         with lang_lock:
             return text if mode_gen[0] == gen else ""
 
@@ -694,7 +715,7 @@ async def ws_audio(ws: WebSocket) -> None:
             async with gpu_lock:
                 if index <= live["final_sent"]:
                     return
-                text = await to_thread_to_end(partial_job, audio, index)
+                text = await to_thread_to_end(partial_job, audio, index, started_in)
             if text and index > live["final_sent"] and index not in gone and run[0] == started_in:
                 await ws.send_json({"type": "partial", "index": index, "text": text, "audio_end": audio_end})
         except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
@@ -826,6 +847,7 @@ async def ws_audio(ws: WebSocket) -> None:
                     run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
                     seg.reset()
                     gone.clear()
+                    shown.clear()
                     live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
                     ctx.update(text="", lang="")
                     bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0

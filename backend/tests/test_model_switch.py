@@ -82,7 +82,8 @@ def say(sock):
 def test_status_lists_what_the_page_may_choose(fake):
     msg = server.status_message()
     assert msg["default_model"] == server.MODEL
-    assert {server.MODEL, "large-v3-turbo", "large-v3"} == set(msg["models"])
+    # The experimental AlignAtt engine is offered only where its packages are installed.
+    assert {server.MODEL, "large-v3-turbo", "large-v3"} == set(msg["models"]) - set(server.ALIGNATT_MODELS)
     assert msg["default_compute"] == server.COMPUTE_TYPE
     assert {server.COMPUTE_TYPE, "auto", "float16", "int8_float16", "int8"} == set(msg["compute_types"])
 

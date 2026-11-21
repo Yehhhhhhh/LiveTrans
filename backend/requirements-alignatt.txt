@@ -1,0 +1,10 @@
+# Optional: the experimental AlignAtt engine (设置 → 识别 → 模型 → "AlignAtt 同传（实验）", see
+# alignatt.py). It runs OpenAI's PyTorch Whisper instead of faster-whisper, because AlignAtt needs
+# the decoder's cross-attention, which CTranslate2 doesn't expose. About 3 GB to download.
+# Install into the project's .venv:
+#   .venv\Scripts\python -m pip install -r backend\requirements-alignatt.txt
+# torch is pinned to a release the CUDA index has: with a range, pip may take a newer CPU-only
+# build from PyPI instead.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.1
+openai-whisper>=20240930

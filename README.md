@@ -130,6 +130,21 @@
 - 「用术语表提示识别」仍然有效：术语作为关键词发给 AssemblyAI（最多 100 条，每条不超过 50 个字符）。
 - 「说话时逐词实时显示」、提前翻译、断线续传照常工作。和 AssemblyAI 的连接中断时会自动重连并补发还没出结果的音频。AssemblyAI 要求音频按说话的速度发送，补发的音频也只能按原速发，所以断线几秒，之后的字幕就会晚几秒，直到下一次「停止」再「开始」；Key 无效或余额不足时不重试，页面上方会提示。
 - 引擎、Key、模型的改动在下一次「开始」生效。按时长计费从「开始」算到「停止」，不用时请停止。
+### 实验：AlignAtt 同传模式（本地 Whisper）
+
+本地 Whisper 默认在说话时每 0.6 秒把整句重新识别一遍，所以实时文字会跳动，句末再整句换成精确结果。AlignAtt 模式借鉴 [SimulStreaming](https://github.com/ufal/SimulStreaming)（IWSLT 2025 同传评测第一）的同传策略：解码时观察 Whisper 的交叉注意力，一旦它开始“看”音频最后约 0.5 秒（那里的词可能还没说完）就停下，最后一个词也先不显示。实时文字因此**只增不改**，句末只补上剩下的部分，已显示的词保留不变。
+
+启用：
+
+1. 额外安装 PyTorch 版 Whisper（约 3GB）：`.venv\Scripts\python -m pip install -r backend\requirements-alignatt.txt`
+2. 重启后端，在「设置 → 识别 → 模型」选「large-v3-turbo · AlignAtt 同传（实验）」或「large-v3 · AlignAtt 同传（实验）」。第一次会下载 OpenAI 的模型文件（turbo 约 1.6GB，large-v3 约 3GB，存在 `%USERPROFILE%\.cache\whisper`，可用 `LIVETRANS_WHISPER_PT_DIR` 改位置）。
+
+说明：
+
+- 只用于本地 Whisper；AssemblyAI 不受影响。断句、识别语言、术语表提示、上下文、断线续传都照常工作。
+- 固定用 float16（GPU）/ float32（CPU），「计算精度」对它不起作用；显存约 1.8GB。
+- 解码是贪心解码（不用 beam search）。一段 55 秒的英语合成语音测试中，实时文字改写 0 次（默认方式 20 次），每次更新约 0.36 秒（默认约 0.78 秒），最终文字与默认方式基本一致；第一个词出现得稍晚（约 1.6 秒，默认约 1.0 秒）。真实课堂录音、意大利语还没有测过。
+
 ## 识别参数（设置 → 识别）
 
 - **识别语言**：
@@ -191,6 +206,7 @@
 | `LIVETRANS_PORT` | `8765` | 端口 |
 | `LIVETRANS_ALLOWED_HOSTS` | - | 除 `localhost` 和 IP 地址外，还允许用哪些主机名打开页面，逗号分隔（例如 `LIVETRANS_HOST=0.0.0.0` 时本机的网络名） |
 | `LIVETRANS_RECORD` | - | 设为 `1` 时把每次采集的原始 16kHz 音频保存到 `recordings/`，用于调参 |
+| `LIVETRANS_WHISPER_PT_DIR` | `%USERPROFILE%\.cache\whisper` | AlignAtt 模式（实验）的 PyTorch 模型文件存放位置 |
 | `HF_ENDPOINT` | - | HuggingFace 镜像 |
 
 后端只接受来自自己页面的请求：浏览器里打开的其他网站不能连接 `/ws` 或调用 API（会被拒绝并在日志中记录），命令行工具、脚本不受影响。用 IP 地址或 `localhost` 打开页面都可以；用其他主机名打开时，需要把它加到 `LIVETRANS_ALLOWED_HOSTS`。
@@ -213,6 +229,7 @@ backend/tools/         freeze_lock.py：由当前环境生成 requirements.lock
 backend/server.py      FastAPI：/ws 音频流、/api/translate 翻译代理、/api/window 窗口信息、静态页面
 backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（识别语言模式）、幻觉过滤
+backend/alignatt.py    实验：PyTorch Whisper + AlignAtt 同传解码（依赖见 requirements-alignatt.txt）
 backend/assembly.py    AssemblyAI 流式识别（云端识别引擎）
 backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
 backend/guard.py       只放行本页面的请求：检查 Host / Origin，挡住其他网站和 DNS 重绑定

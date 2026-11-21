@@ -534,6 +534,8 @@ function onStatus(msg) {
 const MODEL_LABELS = {
   'large-v3-turbo': 'large-v3-turbo（快）',
   'large-v3': 'large-v3（更准，更慢，更占显存）',
+  'alignatt-large-v3-turbo': 'large-v3-turbo · AlignAtt 同传（实验，实时文字只增不改）',
+  'alignatt-large-v3': 'large-v3 · AlignAtt 同传（实验，更准，更慢，更占显存）',
 };
 const COMPUTE_LABELS = {
   auto: '自动（GPU 用 float16，CPU 用 int8）',
@@ -592,7 +594,7 @@ function showAsrModels(msg) {
 
 // Rough VRAM need of a model: its weights (parameter count x bytes per weight) plus about
 // 1.5 GB for the CUDA libraries and the decoding work area. An estimate, not a measurement.
-const MODEL_PARAMS_M = { 'large-v3-turbo': 809, 'large-v3': 1550 };
+const MODEL_PARAMS_M = { 'large-v3-turbo': 809, 'large-v3': 1550, 'alignatt-large-v3-turbo': 809, 'alignatt-large-v3': 1550 };
 const WEIGHT_BYTES = { float16: 2, int8_float16: 1, int8: 1, float32: 4 };
 
 function estimateVramGb(model, compute, onCpu) {
