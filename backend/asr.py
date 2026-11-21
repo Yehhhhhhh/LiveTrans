@@ -347,8 +347,43 @@ class Transcriber:
         else:
             self.status = "ready"
 
+    @property
+    def engine(self):
+        """The AlignAtt model (alignatt.py) when one is loaded, which then answers the calls below."""
+        return self.model if getattr(self.model, "alignatt", False) else None
+
+    def _load_alignatt(self, model_name: str, device: str) -> str:
+        from alignatt import AlignAttModel, available
+
+        if not available():
+            return "AlignAtt 需要先安装 PyTorch 版 Whisper：.venv\\Scripts\\python -m pip install -r backend\\requirements-alignatt.txt"
+        errors = []
+        for dev in [d for d in ("cuda", "cpu") if device in ("auto", d)]:
+            try:
+                t0 = time.time()
+                model = AlignAttModel(model_name, dev, self._report)
+                self.model, self.device, self.compute_type = model, dev, model.compute_type
+                self.error = "" if dev == "cuda" or device == "cpu" else "未能使用 GPU，已回退到 CPU：" + "; ".join(errors)
+                log.info("Loaded %s on %s/%s in %.1fs", model_name, dev, model.compute_type, time.time() - t0)
+                return ""
+            except Exception as e:  # noqa: BLE001 - report any failure and try the next device
+                log.exception("Failed to load %s on %s", model_name, dev)
+                errors.append(f"{dev}: {e}")
+            finally:
+                self.progress = None
+                self.on_progress()
+        return "; ".join(errors)
+
     def _load(self, model_name: str, device: str, compute_type: str) -> str:
         """Try to load a model: "" when it is loaded, else what went wrong."""
+        if model_name.startswith("alignatt-"):
+            self.model_name = model_name
+            error = self._load_alignatt(model_name, device)
+            if not error:
+                # Its precision is fixed (float16 on a GPU); the compute-type choice doesn't apply.
+                self.choice = (model_name, compute_type)
+            return error
+
         from faster_whisper import WhisperModel
 
         self.model_name = model_name
@@ -390,6 +425,8 @@ class Transcriber:
     def pick_language(self, audio: np.ndarray, among: tuple[str, ...] | None = LANGS) -> tuple[str, float]:
         """Most likely language of the audio, restricted to `among` (None = any), and its
         probability relative to those candidates."""
+        if self.engine:
+            return self.engine.pick_language(audio, among)
         _, _, probs = self.model.detect_language(audio)
         if among is None:
             lang, p = max(probs, key=lambda lp: lp[1])
@@ -400,11 +437,16 @@ class Transcriber:
         return lang, scores.get(lang, 0.0) / total
 
     def count_tokens(self, text: str) -> int:
+        if self.engine:
+            return self.engine.count_tokens(text)
         # As faster-whisper encodes a prompt: a leading space, no special tokens.
         return len(self.model.hf_tokenizer.encode(" " + text.strip(), add_special_tokens=False).ids)
 
-    def transcribe_partial(self, audio: np.ndarray, lang: str, prompt: str = "") -> str:
-        """Fast greedy pass over a segment still being spoken; the final pass redoes it properly."""
+    def transcribe_partial(self, audio: np.ndarray, lang: str, prompt: str = "", state=None) -> str:
+        """Fast greedy pass over a segment still being spoken; the final pass redoes it properly.
+        `state` (an alignatt.StreamState, kept per segment) is only used by the AlignAtt engine."""
+        if self.engine:
+            return self.engine.transcribe_partial(audio, lang, prompt, state)
         initial_prompt = fit_prompt(self.count_tokens, prompt) if prompt else ""
         segments, _ = self.model.transcribe(
             audio,
@@ -428,10 +470,14 @@ class Transcriber:
         prompt: str = "",
         context: str = "",
         context_lang: str = "",
+        state=None,
     ) -> dict:
         """`context` is the text recognized just before this audio, in `context_lang`. It is given
         to Whisper as the transcript so far (see fit_prompt), but only when this audio is in the
-        same language: text in another language pulls the decoding toward that language."""
+        same language: text in another language pulls the decoding toward that language.
+        `state`: the segment's live state, see transcribe_partial."""
+        if self.engine:
+            return self.engine.transcribe(audio, language, prompt, context, context_lang, state)
         t0 = time.time()
         mode = normalize_language(language) or IT_EN
         if is_fixed(mode):
