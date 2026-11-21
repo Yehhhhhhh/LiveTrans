@@ -81,6 +81,8 @@ const settings = deepMerge(DEFAULTS, loadJson('livetrans.settings'));
 const saveSettings = () => saveJson('livetrans.settings', settings);
 // Before "自动（所有语言）" existed, "auto" meant Italian / English: keep what it did.
 if (settings.asr.language === 'auto') settings.asr.language = 'it_en';
+// Universal-3.6 Pro is no longer offered: AssemblyAI names STT-3.7 Realtime-Agent as its successor.
+if (settings.asr.assemblyModel === 'universal-3-6-pro') settings.asr.assemblyModel = 'assemblyai-stt-3-7-realtime-agent';
 
 let glossary = loadJson('livetrans.glossary');
 const saveGlossary = () => saveJson('livetrans.glossary', glossary);
@@ -497,8 +499,8 @@ const runEngine = new Map();
 const ASSEMBLY_LABELS = {
   '': 'Universal-Streaming English',
   'universal-streaming-multilingual': 'Universal-Streaming Multilingual',
-  'universal-3-6-pro': 'Universal-3.6 Pro',
   'assemblyai-stt-3-7-realtime': 'STT-3.7 Realtime',
+  'assemblyai-stt-3-7-realtime-agent': 'STT-3.7 Realtime-Agent',
 };
 let whisperStatus = null; // the backend's last 'status' message
 let engineState = ''; // of the current run's AssemblyAI stream: connecting | ready | error | ''

@@ -23,13 +23,15 @@ URL = "wss://streaming.assemblyai.com/v3/ws"
 
 ENGLISH = "universal-streaming-english"  # English only; reports no language
 MULTILINGUAL = "universal-streaming-multilingual"  # en/es/de/fr/pt/it, one language per turn
-PRO = "universal-3-6-pro"  # 32 languages, switches within a sentence
-STT37 = "assemblyai-stt-3-7-realtime"  # 32 languages, switches within a sentence; for notetakers
+# AssemblyAI-STT-3.7: 32 languages, switches within a sentence. The Agent model (for voice
+# agents, which AssemblyAI offers in place of Universal-3.6 Pro) costs more.
+STT37 = "assemblyai-stt-3-7-realtime"
+AGENT = "assemblyai-stt-3-7-realtime-agent"
 # Models whose turns always come formatted (they take no format_turns: each turn ends once) and
 # that can be steered toward the recognition languages (language_codes).
-STEERABLE = (PRO, STT37)
+STEERABLE = (STT37, AGENT)
 # Only these names are ever sent: the name comes from the page.
-MODELS = (ENGLISH, MULTILINGUAL, PRO, STT37)
+MODELS = (ENGLISH, MULTILINGUAL, STT37, AGENT)
 DEFAULT_MODEL = ENGLISH
 
 # Audio goes out in chunks of this size (the API accepts 20-1000 ms per message).
@@ -93,7 +95,7 @@ def keyterms(prompt: str) -> list[str]:
 
 def language_codes(model: str, language: object) -> list[str] | None:
     """Languages to steer the model toward, for the recognition-language setting; None = no
-    steering. Only Universal-3.6 Pro and STT-3.7 Realtime take them: the other models choose by
+    steering. Only the STT-3.7 models take them: the other models choose by
     themselves."""
     if model not in STEERABLE:
         return None
