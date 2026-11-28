@@ -40,6 +40,14 @@ EFFORT_MODEL = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-5")
 FALLBACK_MODEL = re.compile(r"^claude-(opus-5|sonnet-5-5|fable-5)")
 
 
+# Gemini (via an OpenAI-compatible endpoint) thinks by default, which only adds latency to a
+# subtitle. Ask for no thinking; models that can't switch it off (2.5 Pro, Gemini 3 Pro...) reject
+# that, so step down to the lowest level they take, and finally leave the parameter out.
+GEMINI_MODEL = re.compile(r"gemini", re.I)
+GEMINI_EFFORTS = ("none", "minimal", "low")
+# A 400 caused by reasoning_effort mentions one of these.
+EFFORT_ERROR = re.compile(r"reasoning|thinking|budget|effort", re.I)
+
 OLLAMA_URL = "http://127.0.0.1:11434"
 # Glossary + context + sentence fit easily; a small window keeps VRAM free for Whisper.
 OLLAMA_CTX = 4096
@@ -105,6 +113,9 @@ class Translator:
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
         self._claude_clients: dict[str, anthropic.AsyncAnthropic] = {}
         self._no_temperature: set[tuple[str, str]] = set()
+        # (base, model) of a Gemini model -> index into GEMINI_EFFORTS of the level it accepts
+        # (len(GEMINI_EFFORTS): none of them, send no reasoning_effort).
+        self._gemini_effort: dict[tuple[str, str], int] = {}
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -237,8 +248,12 @@ class Translator:
         key = (base, model)
         if key not in self._no_temperature:
             body["temperature"] = 0.2
+        if GEMINI_MODEL.search(model):
+            level = self._gemini_effort.setdefault(key, 0)
+            if level < len(GEMINI_EFFORTS):
+                body["reasoning_effort"] = GEMINI_EFFORTS[level]
         try:
-            for _ in range(2):
+            for _ in range(2 + len(GEMINI_EFFORTS)):
                 async with self.http.stream("POST", f"{base}/chat/completions", json=body, headers=headers) as r:
                     if r.status_code >= 400:
                         err = (await r.aread()).decode("utf-8", "replace")
@@ -246,6 +261,14 @@ class Translator:
                             # Some models (e.g. reasoning models) only accept the default temperature.
                             self._no_temperature.add(key)
                             del body["temperature"]
+                            continue
+                        if r.status_code == 400 and "reasoning_effort" in body and EFFORT_ERROR.search(err):
+                            # This model can't go that low: try the next level up, or none at all.
+                            level = self._gemini_effort[key] = self._gemini_effort[key] + 1
+                            if level < len(GEMINI_EFFORTS):
+                                body["reasoning_effort"] = GEMINI_EFFORTS[level]
+                            else:
+                                del body["reasoning_effort"]
                             continue
                         raise TranslateError(f"HTTP {r.status_code}：{err[:300]}")
                     async for line in r.aiter_lines():
