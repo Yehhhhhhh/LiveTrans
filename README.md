@@ -236,7 +236,9 @@ backend/translate.py   OpenAI 兼容接口 / Claude / Ollama 本地模型
 backend/guard.py       只放行本页面的请求：检查 Host / Origin，挡住其他网站和 DNS 重绑定
 backend/winfo.py       由窗口句柄查程序名、窗口标题和图标（Windows API）
 backend/tests/         pytest 单元测试（依赖见 requirements-dev.txt）
-frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB 记录
+frontend/              页面、音频采集（AudioWorklet 16kHz）、IndexedDB 记录；原生 ES 模块，无构建步骤，app.js 只负责装配各模块
+frontend/lib/          不依赖 DOM 的纯逻辑：断线续传缓冲、采集时钟、断句、公式切分、术语表、翻译上下文等
+frontend/tests/        frontend/lib 的单元测试（node --test，lint.py 会运行）
 frontend/vendor/katex/ KaTeX 公式渲染（离线）
 install.bat            创建 .venv 并安装依赖
 start.bat              启动后端，就绪后打开页面
@@ -247,7 +249,7 @@ start.bat              启动后端，就绪后打开页面
 Pull Request 上有两个工作流：CI 在每次创建或更新时都运行；Codex PR Review 只在创建时自动运行一次，之后手动触发。
 
 - **CI**（`.github/workflows/ci.yml`）
-  - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、`.bat` 必须是纯 ASCII + CRLF。
+  - Lint：`python .github/scripts/lint.py` —— Python 语法、前端 JS 语法（`node --check`）、前端单元测试（`node --test`）、`.bat` 必须是纯 ASCII + CRLF。
   - Build & Test（Windows、Python 3.12）：按 install.bat 的方式安装依赖，检查 `import server`，有 `backend/tests` 时运行 pytest。
   - 项目没有配置类型检查器，所以不做 Type Check。
   - `CI result` 汇总上面所有任务，分支保护只需把它设为必需检查。
@@ -263,3 +265,5 @@ Pull Request 上有两个工作流：CI 在每次创建或更新时都运行；C
 .venv\Scripts\python .github\scripts\lint.py
 .venv\Scripts\python -m pytest backend\tests
 ```
+
+只跑前端单元测试（需要 Node.js 22+）：`node --test "frontend/tests/*.test.js"`。
