@@ -332,6 +332,49 @@ def apply_config(seg: Segmenter, asr: dict) -> None:
         p.max_segment_s = min(28.0, max(2.0, float(asr["max_segment_s"])))
 
 
+class BadMessage(ValueError):
+    """A text message from the page that can't be used. It is logged and ignored: ending the
+    connection over it would not help, as the page reconnects and sends the same settings again."""
+
+
+# The VAD settings of a "config" message, which apply_config takes with float().
+VAD_SETTINGS = ("vad_threshold", "min_silence_ms", "max_segment_s")
+
+
+def converts(to: type, value: object) -> bool:
+    """Whether to(value) works: float("0.5") does, float(None) and int("1.5") don't."""
+    try:
+        to(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def read_message(text: str) -> dict:
+    """A text message from the page, checked before any of it is applied, so that a bad value
+    can't stop its handler half-way. Raises BadMessage. Everything the handlers ignore or fall
+    back from (unknown types and fields, a model name that isn't one, ...) is let through."""
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as e:
+        raise BadMessage(f"not JSON ({e})") from None
+    if not isinstance(data, dict):
+        raise BadMessage("not a JSON object")
+    kind = data.get("type")
+    if kind == "config":
+        asr = data.get("asr") or {}
+        if not isinstance(asr, dict):
+            raise BadMessage("config: asr is not an object")
+        for name in VAD_SETTINGS:
+            if name in asr and not converts(float, asr[name]):
+                raise BadMessage(f"config: asr.{name} is not a number")
+        if not isinstance(data.get("prompt") or "", str):
+            raise BadMessage("config: prompt is not a string")
+    elif kind == "resume" and not converts(int, data.get("offset") or 0):
+        raise BadMessage("resume: offset is not a whole number")
+    return data
+
+
 # Live partials: re-transcribe the segment in progress at most this often.
 PARTIAL_INTERVAL_S = 0.6
 PARTIAL_MIN_AUDIO_S = 0.8
@@ -354,7 +397,7 @@ MODEL_WAIT_POLL_S = 0.2
 # after this long (the window picker was left open): an open session is billed.
 SPARE_KEEP_S = 60.0
 # A failed final transcription is retried this many times in all, this long apart, before its
-# audio is given up (and stops being kept for resending, see ws_audio).
+# audio is given up (and stops being kept for resending, see AudioSession.committed).
 TRANSCRIBE_ATTEMPTS = 3
 TRANSCRIBE_RETRY_S = 1.0
 # Context: the end of what was just recognized is given to Whisper with the next segment (see
@@ -424,134 +467,341 @@ def open_recording() -> wave.Wave_write:
     return w
 
 
-@app.websocket("/ws")
-async def ws_audio(ws: WebSocket) -> None:
-    await ws.accept()
-    clients.add(ws)
-    await ws.send_json(status_message())
+def alignatt_on() -> bool:
+    """The loaded model is the AlignAtt engine's (see alignatt.py)."""
+    return getattr(transcriber, "engine", None) is not None
 
-    seg = Segmenter(vad_model, SegmenterParams())
-    opts = {
-        "language": IT_EN, "prompt": "", "partial": True, "context": True,
-        # Recognition engine: "local" (Whisper) or "assemblyai" (see assembly.py), with its API
-        # key and model. Applied by the next "start" / "resume".
-        "engine": "local", "key": "", "ai_model": assembly.DEFAULT_MODEL,
-    }
-    # run -> its AssemblyAI stream, for runs captured with that engine. `cloud`: the current run
-    # is one of them, so its audio goes to the stream and not through the VAD to Whisper.
-    streams: dict[int, assembly.AssemblyStream] = {}
-    cloud = [False]
-    # A stream opened ahead of its run ("prepare": the page is about to start capturing), so that
-    # the connection is there when the audio begins. Audio that waits for the connection is sent
-    # at the speed it was captured at, and the whole run's results would stay that far behind.
-    # Its run is 0 until a "start" takes it. "state": its last reported state.
-    spare: dict = {"stream": None, "state": "", "timer": None}
 
-    def drop_spare() -> None:
-        s, timer = spare["stream"], spare["timer"]
-        spare.update(stream=None, state="", timer=None)
+class AudioSession:
+    """One /ws connection: the page's audio and settings come in, its subtitles go out.
+
+    Each capture run (开始 … 停止) goes to one recognition engine. Whisper: the VAD (Segmenter)
+    cuts the audio into segments, `worker` transcribes them in order, and `maybe_partial` shows
+    the segment in progress meanwhile. AssemblyAI: the audio goes to the run's stream, and
+    `on_stream` passes its events on as the same messages. ws_audio hands it what the page sends.
+    """
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.seg = Segmenter(vad_model, SegmenterParams())
+
+        # The page's settings ("config"). The engine, its API key and its model are applied by
+        # the next "start" / "resume".
+        self.language = IT_EN
+        self.prompt = ""
+        self.use_partials = True
+        self.use_context = True
+        self.engine = "local"  # "local" (Whisper) or "assemblyai" (see assembly.py)
+        self.key = ""
+        self.ai_model = assembly.DEFAULT_MODEL
+
+        # Capture run, set by every "start" (the page numbers its runs); tags queued segments (see
+        # take_batch) and is echoed in their results, so a run that is still being transcribed
+        # after 开始 was pressed again keeps its own time base on the page and can't touch the new
+        # run's state.
+        self.run = 0
+        # run -> its AssemblyAI stream, for runs captured with that engine. `cloud`: the current
+        # run is one of them, so its audio goes to the stream and not through the VAD to Whisper.
+        self.streams: dict[int, assembly.AssemblyStream] = {}
+        self.cloud = False
+        # A stream opened ahead of its run ("prepare": the page is about to start capturing), so
+        # that the connection is there when the audio begins. Audio that waits for the connection
+        # is sent at the speed it was captured at, and the whole run's results would stay that far
+        # behind. Its run is 0 until a "start" takes it. spare_state: its last reported state.
+        self.spare: assembly.AssemblyStream | None = None
+        self.spare_state = ""
+        self.spare_timer: asyncio.TimerHandle | None = None
+
+        # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
+        # resends it from the last "committed" position, i.e. the point before which every segment
+        # has been answered (or was silence). Positions are samples since the page pressed 开始.
+        # run -> position of that run's first sample on this connection (set by "resume"). Per
+        # run: a reconnecting page may resend several runs, and a run's segments can still be
+        # transcribed after the next run began.
+        self.bases: dict[int, int] = {}
+        self.unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
+
+        # Segments waiting for their final transcription, and how many the worker has taken off
+        # the queue whose result hasn't been sent yet.
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.in_hand = 0
+        # What the last answered segment said, in which language, and when (seconds, on the same
+        # clock as a result's "start") it ended. Used as context for the next segment of the same
+        # run.
+        self.ctx_text = ""
+        self.ctx_lang = ""
+        self.ctx_run = 0
+        self.ctx_end = 0.0
+
+        # Live partials: one at a time (partial_busy), every partial_every frames at most
+        # (partial_frame: seg.frames_seen when the last one started), and none for a segment whose
+        # final result was sent (final_sent: the highest index of the current run sent).
+        self.partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
+        self.partial_busy = False
+        self.partial_frame = 0
+        self.final_sent = 0
+        self.partial_tasks: set[asyncio.Task] = set()
+        # Segments of the current run discarded as noise (too little speech). A partial of one may
+        # still be running in its worker thread when the page is told to drop the line: its text
+        # must not be sent afterwards, or the line would come back and stay ("识别中…") with
+        # nothing to replace it until the next sentence.
+        self.gone: set[int] = set()
+        # AlignAtt engine only: (run, index) -> what its partials have shown of the segment in
+        # progress, which its final transcription keeps as its start (see alignatt.py).
+        self.shown: dict[tuple[int, int], alignatt.StreamState] = {}
+        # The language detected for the segment in progress (detected_index), kept for its next
+        # partials. mode_gen is bumped whenever the recognition language mode changes: a partial
+        # that started under an older mode (it runs in a worker thread) neither caches the
+        # language it detected nor shows its text. lang_lock keeps the mode, its generation and
+        # the cache consistent across threads.
+        self.detected_index = 0
+        self.detected_lang = ""
+        self.mode_gen = 0
+        self.lang_lock = threading.Lock()
+
+        # The status bar's speech indicator: what was sent last, and when.
+        self.speaking = False
+        self.last_level = 0.0
+        self.rec: wave.Wave_write | None = None  # LIVETRANS_RECORD
+
+        self.worker_task = asyncio.create_task(self.worker())
+
+    def close(self) -> None:
+        """The page went away: stop everything this connection started."""
+        self.close_recording()
+        self.worker_task.cancel()
+        for t in self.partial_tasks:
+            t.cancel()
+        for stream in self.streams.values():
+            stream.abort()
+        if self.spare_timer:
+            self.spare_timer.cancel()
+        if self.spare:
+            self.spare.abort()
+
+    def close_recording(self) -> None:
+        if self.rec is not None:
+            self.rec.close()
+            self.rec = None
+
+    # ------------------------------------------------------------ the page's messages
+
+    async def on_audio(self, pcm: bytes) -> None:
+        """A chunk of the capture: 16 kHz mono PCM16."""
+        if RECORD:
+            if self.rec is None:
+                self.rec = open_recording()
+            self.rec.writeframes(pcm)
+        new = self.seg.feed(pcm)
+        if self.cloud:
+            # AssemblyAI finds the sentences itself; the VAD only feeds the status bar.
+            self.seg.take_dropped()
+            if self.run in self.streams:
+                self.streams[self.run].feed(pcm)
+        else:
+            await self.enqueue(new)
+        now = time.monotonic()
+        if self.seg.speaking != self.speaking or now - self.last_level >= VAD_LEVEL_INTERVAL_S:
+            self.speaking = self.seg.speaking
+            self.last_level = now
+            await self.ws.send_json({
+                "type": "vad",
+                "speaking": self.speaking,
+                "prob": round(self.seg.take_peak_prob(), 2),
+                **self.commit_info(),
+            })
+        if not self.cloud:
+            self.maybe_partial()
+
+    async def on_text(self, text: str) -> None:
+        """A JSON message. One that can't be used is logged and ignored (see read_message); one of
+        a type not handled here is ignored without a word."""
+        try:
+            data = read_message(text)
+        except BadMessage as e:
+            # Not the message itself: a config message carries the AssemblyAI API key.
+            log.warning("Ignored a message from the page: %s", e)
+            return
+        match data.get("type"):
+            case "config":
+                await self.on_config(data)
+            case "prepare":
+                await self.on_prepare(data)
+            case "unprepare":
+                self.on_unprepare()
+            case "start":
+                await self.on_start(data)
+            case "resume":
+                await self.on_start(data, resume=True)
+            case "stop":
+                await self.on_stop()
+
+    async def on_config(self, data: dict) -> None:
+        """The recognition settings (设置 → 识别), sent on connecting and after every change."""
+        asr = data.get("asr") or {}
+        apply_config(self.seg, asr)
+        mode = normalize_language(asr.get("language"))
+        if mode and mode != self.language:
+            # The language detected for the segment in progress was chosen under the old mode:
+            # detect again for its next partials, and drop partials still running under the old
+            # mode (see partial_job).
+            with self.lang_lock:
+                self.language = mode
+                self.mode_gen += 1
+                self.detected_index, self.detected_lang = 0, ""
+            self.ctx_text, self.ctx_lang = "", ""
+        if "partial" in asr:
+            self.use_partials = bool(asr["partial"])
+        if "context" in asr:
+            self.use_context = bool(asr["context"])
+        if "model" in asr or "compute" in asr:
+            request_model(asr.get("model"), asr.get("compute"))
+        self.prompt = (data.get("prompt") or "")[:1000]
+        if asr.get("engine") in ("local", "assemblyai"):
+            self.engine = asr["engine"]
+        if isinstance(asr.get("assemblyai_key"), str):
+            self.key = asr["assemblyai_key"].strip()
+        self.ai_model = assembly.normalize_model(asr.get("assemblyai_model")) or self.ai_model
+        if self.engine == "local":
+            await need_whisper()
+        if self.run in self.streams:  # language or glossary changed while capturing
+            self.streams[self.run].update(self.language, assembly.keyterms(self.prompt))
+
+    async def on_prepare(self, data: dict) -> None:
+        """开始 was pressed: the page now asks for its audio sources (a window picker, a permission
+        prompt), and "start" follows once it has them. Connect to AssemblyAI meanwhile."""
+        self.drop_spare()
+        key, ai_model = self.assembly_choice(data)
+        if data.get("engine") == "assemblyai" and key:
+            self.spare = self.new_stream(key, ai_model)
+            self.spare_timer = asyncio.get_running_loop().call_later(SPARE_KEEP_S, self.drop_spare)
+            self.spare.start()
+
+    def on_unprepare(self) -> None:
+        """The page got no audio sources after all."""
+        self.drop_spare()
+
+    async def on_start(self, data: dict, resume: bool = False) -> None:
+        """"start": a new capture run. "resume" (`resume`): a reconnecting page continues its run
+        at `offset` and resends the audio from there; segment start times continue from that
+        position."""
+        old = self.run
+        r = data.get("run")
+        self.run = r if isinstance(r, int) and not isinstance(r, bool) else self.run + 1
+        self.seg.reset()
+        self.gone.clear()
+        self.shown.clear()
+        self.partial_frame = self.final_sent = self.detected_index = 0
+        self.detected_lang = ""
+        self.ctx_text, self.ctx_lang = "", ""
+        self.bases[self.run] = max(0, int(data.get("offset") or 0)) if resume else 0
+        if old != self.run and old in self.streams:
+            self.streams[old].close()  # normally closed already, by "stop"
+        if self.run in self.streams:
+            self.streams.pop(self.run).abort()
+        # The run's engine, key and model come with the message: the page fixes them when the run
+        # starts and repeats them on "resume". The settings may have changed since (they apply
+        # from the next 开始), and audio captured for the local engine must not be sent to
+        # AssemblyAI when the run is resumed.
+        engine = data.get("engine") if data.get("engine") in ("local", "assemblyai") else self.engine
+        key, ai_model = self.assembly_choice(data)
+        self.cloud = engine == "assemblyai"
+        spare_state = self.spare_state
+        if self.cloud and not resume:
+            stream = self.take_spare(key, ai_model)
+        else:
+            stream = None
+            self.drop_spare()
+        if stream:
+            # Connected (or connecting) since "prepare": the settings may have changed.
+            stream.run = self.run
+            self.streams[self.run] = stream
+            stream.update(self.language, assembly.keyterms(self.prompt))
+            await self.ws.send_json({
+                "type": "engine", "state": spare_state or "connecting",
+                "model": stream.model, "run": stream.run,
+            })
+        elif self.cloud:
+            stream = self.new_stream(key, ai_model)
+            stream.run = self.run
+            self.streams[self.run] = stream
+            stream.start()
+        else:
+            await need_whisper()
+        if old and old != self.run:  # 0: no run yet on this connection
+            await self.send_run_done(old)
+
+    async def on_stop(self) -> None:
+        """停止: the segment in progress is cut off and queued, or the run's AssemblyAI stream is
+        closed."""
+        self.close_recording()
+        new = self.seg.flush()
+        if self.cloud:
+            new = []
+            self.seg.take_dropped()
+            if self.run in self.streams:
+                self.streams[self.run].close()
+        await self.enqueue(new)
+        self.speaking = False
+        await self.ws.send_json({"type": "vad", "speaking": False})
+
+    # ------------------------------------------------------------ AssemblyAI
+
+    def assembly_choice(self, data: dict) -> tuple[str, str]:
+        """The API key and model a prepare / start / resume message names, else the settings'."""
+        key = data.get("assemblyai_key")
+        key = key.strip() if isinstance(key, str) else self.key
+        return key, assembly.normalize_model(data.get("assemblyai_model")) or self.ai_model
+
+    def new_stream(self, key: str, model: str) -> assembly.AssemblyStream:
+        return assembly.AssemblyStream(
+            key, model, self.language, assembly.keyterms(self.prompt), self.on_stream,
+        )
+
+    def drop_spare(self) -> None:
+        s, timer = self.spare, self.spare_timer
+        self.spare, self.spare_state, self.spare_timer = None, "", None
         if timer:
             timer.cancel()
         if s:
             s.close()  # ends the session properly: an open one is billed
 
-    def take_spare(key: str, model: str) -> assembly.AssemblyStream | None:
+    def take_spare(self, key: str, model: str) -> assembly.AssemblyStream | None:
         """The prepared stream, if it fits the run that starts now and is still good."""
-        s, state = spare["stream"], spare["state"]
+        s, state = self.spare, self.spare_state
         if s and not s.done and not s.dead and state != "error" and (s.key, s.model) == (key, model):
-            spare["stream"] = None  # kept open: drop_spare only clears the rest
-            drop_spare()
+            self.spare = None  # kept open: drop_spare only clears the rest
+            self.drop_spare()
             return s
-        drop_spare()
+        self.drop_spare()
         return None
 
-    # What the last answered segment said, in which language, and when (seconds, on the same clock
-    # as a result's "start") it ended. Used as context for the next segment of the same run.
-    ctx = {"text": "", "lang": "", "run": 0, "end": 0.0}
-    queue: asyncio.Queue = asyncio.Queue()
-    live = {"busy": False, "last_frame": 0, "final_sent": 0, "lang_index": 0, "lang": ""}
-    partial_every = round(PARTIAL_INTERVAL_S * 16000 / 512)
-
-    in_hand = [0]  # segments taken off the queue whose result hasn't been sent yet
-    # Capture run, set by every "start" (the page numbers its runs); tags queued segments (see
-    # take_batch) and is echoed in their results, so a run that is still being transcribed after
-    # 开始 was pressed again keeps its own time base on the page and can't touch the new run's state.
-    run = [0]
-
-    # Resuming after a dropped connection: the page keeps the audio it sent and, on reconnect,
-    # resends it from the last "committed" position, i.e. the point before which every segment
-    # has been answered (or was silence). Positions are samples since the page pressed 开始.
-    # run -> position of that run's first sample on this connection (set by "resume"). Per run:
-    # a reconnecting page may resend several runs, and a run's segments can still be transcribed
-    # after the next run began.
-    bases: dict[int, int] = {}
-    unsent: dict[tuple[int, int], int] = {}  # (run, index) -> start position, not answered yet
-    # Segments of the current run discarded as noise (too little speech). A partial of one may
-    # still be running in its worker thread when the page is told to drop the line: its text must
-    # not be sent afterwards, or the line would come back and stay ("识别中…") with nothing to
-    # replace it until the next sentence.
-    gone: set[int] = set()
-    # AlignAtt engine only: (run, index) -> what its partials have shown of the segment in
-    # progress, which its final transcription keeps as its start (see alignatt.py).
-    shown: dict[tuple[int, int], alignatt.StreamState] = {}
-
-    def alignatt_on() -> bool:
-        return getattr(transcriber, "engine", None) is not None
-
-    async def send_dropped() -> None:
-        for index in seg.take_dropped():
-            gone.add(index)
-            shown.pop((run[0], index), None)
-            await ws.send_json({"type": "partial_drop", "index": index})
-
-    def committed() -> int:
-        if run[0] in streams:
-            return bases.get(run[0], 0) + streams[run[0]].committed
-        pos = seg.committed_frames() * FRAME
-        mine = [p for (r, _), p in unsent.items() if r == run[0]]
-        if mine:
-            pos = min(pos, min(mine))
-        return bases.get(run[0], 0) + pos
-
-    async def send_run_done(r: int) -> None:
-        # An ended run (开始 pressed again, or the next run resumed) whose segments are all
-        # answered: the page can drop the audio it kept for it.
-        if r == run[0] or any(k[0] == r for k in unsent):
-            return
-        if r in streams and not streams[r].done:
-            return  # its last turn is still coming (see on_stream, "closed")
-        streams.pop(r, None)
-        await ws.send_json({"type": "run_done", "run": r})
-
-    def stream_commit(s: assembly.AssemblyStream) -> dict:
-        return {"committed": bases.get(s.run, 0) + s.committed, "committed_run": s.run}
-
-    async def on_stream(s: assembly.AssemblyStream, ev: dict) -> None:
+    async def on_stream(self, s: assembly.AssemblyStream, ev: dict) -> None:
         """An AssemblyAI stream's events, as the messages the page knows from the Whisper path."""
-        current = s.run == run[0]  # an older run's indices mean nothing for the current one
+        current = s.run == self.run  # an older run's indices mean nothing for the current one
         kind = ev["kind"]
         if not s.run:
             # Opened ahead of its run and not taken (yet): the page hears of it when it is.
-            if s is spare["stream"] and kind == "state":
-                spare["state"] = ev["state"]
+            if s is self.spare and kind == "state":
+                self.spare_state = ev["state"]
             return
         if kind == "partial":
-            if opts["partial"] and current and ev["index"] > live["final_sent"]:
+            if self.use_partials and current and ev["index"] > self.final_sent:
                 out = {"type": "partial", "index": ev["index"], "text": ev["text"]}
                 if ev.get("end") is not None:
-                    out["audio_end"] = round(bases.get(s.run, 0) / 16000 + ev["end"], 3)
-                await ws.send_json(out)
+                    out["audio_end"] = round(self.bases.get(s.run, 0) / 16000 + ev["end"], 3)
+                await self.ws.send_json(out)
         elif kind == "drop":
             if current:
-                await ws.send_json({"type": "partial_drop", "index": ev["index"]})
+                await self.ws.send_json({"type": "partial_drop", "index": ev["index"]})
         elif kind == "final":
             if current:
-                live["final_sent"] = max(live["final_sent"], ev["index"])
+                self.final_sent = max(self.final_sent, ev["index"])
             log.info("[%s %.2fs %s] %s", ev["lang"], ev["duration"], s.model, ev["text"])
-            await ws.send_json({
+            await self.ws.send_json({
                 "type": "segment",
                 "index": ev["index"],
-                "start": round(bases.get(s.run, 0) / 16000 + ev["start"], 3),
+                "start": round(self.bases.get(s.run, 0) / 16000 + ev["start"], 3),
                 "duration": round(ev["duration"], 2),
                 "lang": ev["lang"],
                 "lang_prob": ev["lang_prob"],
@@ -559,44 +809,117 @@ async def ws_audio(ws: WebSocket) -> None:
                 "asr_ms": 0,
                 "merged": 1,
                 "run": s.run,
-                **stream_commit(s),
+                **self.stream_commit(s),
             })
         elif kind == "state":
-            await ws.send_json({"type": "engine", "state": ev["state"], "model": s.model, "run": s.run})
+            await self.ws.send_json({"type": "engine", "state": ev["state"], "model": s.model, "run": s.run})
             if ev["state"] == "error":
-                await ws.send_json({"type": "error", "message": ev["message"]})
+                await self.ws.send_json({"type": "error", "message": ev["message"]})
         elif kind == "closed":
             # Everything is answered now: the page can drop the audio it kept for this run.
-            await ws.send_json(
-                {"type": "engine", "state": "closed", "model": s.model, "run": s.run, **stream_commit(s)}
+            await self.ws.send_json(
+                {"type": "engine", "state": "closed", "model": s.model, "run": s.run, **self.stream_commit(s)}
             )
-            await send_run_done(s.run)
+            await self.send_run_done(s.run)
 
-    def commit_info() -> dict:
+    def stream_commit(self, s: assembly.AssemblyStream) -> dict:
+        return {"committed": self.bases.get(s.run, 0) + s.committed, "committed_run": s.run}
+
+    # ------------------------------------------------------------ resuming: what is answered
+
+    def committed(self) -> int:
+        if self.run in self.streams:
+            return self.bases.get(self.run, 0) + self.streams[self.run].committed
+        pos = self.seg.committed_frames() * FRAME
+        mine = [p for (r, _), p in self.unsent.items() if r == self.run]
+        if mine:
+            pos = min(pos, min(mine))
+        return self.bases.get(self.run, 0) + pos
+
+    def commit_info(self) -> dict:
         # The run the position belongs to: a message sent before a "start" was processed may reach
         # the page after it started the new run, and must not move that run's resend cursor.
-        return {"committed": committed(), "committed_run": run[0]}
+        return {"committed": self.committed(), "committed_run": self.run}
 
-    async def send_backlog() -> None:
+    async def send_run_done(self, r: int) -> None:
+        # An ended run (开始 pressed again, or the next run resumed) whose segments are all
+        # answered: the page can drop the audio it kept for it.
+        if r == self.run or any(k[0] == r for k in self.unsent):
+            return
+        if r in self.streams and not self.streams[r].done:
+            return  # its last turn is still coming (see on_stream, "closed")
+        self.streams.pop(r, None)
+        await self.ws.send_json({"type": "run_done", "run": r})
+
+    # ------------------------------------------------------------ Whisper: final transcriptions
+
+    async def enqueue(self, new: list[Segment]) -> None:
+        """Queue the segments the VAD finished, and tell the page of those it dropped."""
+        for s in new:
+            s.run = self.run
+            self.unsent[(s.run, s.index)] = round(s.start * 16000)
+            self.queue.put_nowait(s)
+        if new:
+            await self.send_backlog()
+        await self.send_dropped()
+
+    async def send_backlog(self) -> None:
         # Segments waiting for (or in) their final transcription; the UI warns when it grows.
-        await ws.send_json(
-            {"type": "backlog", "pending": queue.qsize() + in_hand[0], **commit_info()}
+        await self.ws.send_json(
+            {"type": "backlog", "pending": self.queue.qsize() + self.in_hand, **self.commit_info()}
         )
 
-    async def transcribe_batch(items: list[Segment]) -> None:
+    async def send_dropped(self) -> None:
+        for index in self.seg.take_dropped():
+            self.gone.add(index)
+            self.shown.pop((self.run, index), None)
+            await self.ws.send_json({"type": "partial_drop", "index": index})
+
+    async def worker(self) -> None:
+        carry: Segment | None = None
+        while True:
+            try:
+                first = carry or await self.queue.get()
+                carry = None
+                self.in_hand = 1
+                await self.wait_for_model()
+                items, carry = take_batch(first, self.queue)
+                self.in_hand = len(items) + (carry is not None)
+                try:
+                    await self.transcribe_batch(items)
+                    await self.send_run_done(items[0].run)
+                finally:
+                    self.in_hand = carry is not None
+                await self.send_backlog()
+            except Exception:  # noqa: BLE001 - one bad batch must not stop transcription for good
+                if self.ws.client_state != WebSocketState.CONNECTED:
+                    return  # the page went away; close() cancels this task anyway
+                log.exception("ASR worker failed on a batch; continuing")
+                carry, self.in_hand = None, 0
+
+    async def wait_for_model(self) -> None:
+        # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
+        # keep that speech queued and transcribe it (merged, see take_batch) once the model is
+        # ready, instead of dropping it. The page shows the backlog meanwhile.
+        if transcriber.status in ("idle", "loading"):
+            await self.send_backlog()
+            while transcriber.status in ("idle", "loading"):
+                await asyncio.sleep(MODEL_WAIT_POLL_S)
+
+    async def transcribe_batch(self, items: list[Segment]) -> None:
         if transcriber.status != "ready":
-            answered(items)
-            await ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
+            self.answered(items)
+            await self.ws.send_json({"type": "error", "message": "模型加载失败，这段语音无法识别"})
             return
         item = merge_segments(items)
-        start = item.start + bases.get(item.run, 0) / 16000
+        start = item.start + self.bases.get(item.run, 0) / 16000
         context = ("", "")
-        if opts["context"] and ctx["run"] == item.run and 0 <= start - ctx["end"] <= CONTEXT_MAX_GAP_S:
-            context = (ctx["text"], ctx["lang"])
+        if self.use_context and self.ctx_run == item.run and 0 <= start - self.ctx_end <= CONTEXT_MAX_GAP_S:
+            context = (self.ctx_text, self.ctx_lang)
         # Answering a batch advances "committed", and the page then drops the kept audio. So a
         # failure (e.g. a transient CUDA error) is retried before the batch is given up.
-        args = [item.audio, opts["language"], opts["prompt"], *context]
-        states = [shown.pop((it.run, it.index), None) for it in items]
+        args = [item.audio, self.language, self.prompt, *context]
+        states = [self.shown.pop((it.run, it.index), None) for it in items]
         if alignatt_on():
             # A merged batch is decoded afresh: its partials' words belong to one part of it.
             args.append(states[0] if len(items) == 1 else None)
@@ -608,316 +931,126 @@ async def ws_audio(ws: WebSocket) -> None:
             except Exception as e:  # noqa: BLE001
                 log.exception("Transcription failed (attempt %d of %d)", attempt, TRANSCRIBE_ATTEMPTS)
                 if attempt == TRANSCRIBE_ATTEMPTS:
-                    answered(items)
-                    await ws.send_json({"type": "error", "message": f"识别出错：{e}"})
+                    self.answered(items)
+                    await self.ws.send_json({"type": "error", "message": f"识别出错：{e}"})
                     return
                 await asyncio.sleep(TRANSCRIBE_RETRY_S)
-        answered(items)
+        self.answered(items)
         for it in items:  # a partial may have started again after the state was taken
-            shown.pop((it.run, it.index), None)
+            self.shown.pop((it.run, it.index), None)
         if res["text"]:
             # Same language and still connected to it: keep the older text too, so a short
             # "Sì." doesn't leave the next segment with almost no context.
             joined = context[1] == res["lang"] and context[0]
-            ctx.update(
-                text=context_tail(f"{context[0]} {res['text']}" if joined else res["text"]),
-                lang=res["lang"],
-                run=item.run,
-                end=start + span_s(items),
-            )
+            self.ctx_text = context_tail(f"{context[0]} {res['text']}" if joined else res["text"])
+            self.ctx_lang = res["lang"]
+            self.ctx_run = item.run
+            self.ctx_end = start + span_s(items)
         res.update(
             type="segment",
             index=item.index,
             start=round(start, 3),
             # Sent with the result itself: if the connection drops right after, the page won't
             # resend (and show twice) the audio of a sentence it already has.
-            **commit_info(),
+            **self.commit_info(),
             duration=round(span_s(items), 2),
             merged=len(items),
             run=item.run,
         )
-        if item.run == run[0]:  # an older run's indices mean nothing for the current one
-            live["final_sent"] = max(live["final_sent"], item.index)
+        if item.run == self.run:  # an older run's indices mean nothing for the current one
+            self.final_sent = max(self.final_sent, item.index)
         log.info(
             "[%s %.2fs %dms%s] %s",
             res["lang"], res["duration"], res["asr_ms"],
             f" merged {len(items)}" if len(items) > 1 else "", res["text"],
         )
-        await ws.send_json(res)
+        await self.ws.send_json(res)
 
-    def answered(items: list[Segment]) -> None:
+    def answered(self, items: list[Segment]) -> None:
         for it in items:
-            unsent.pop((it.run, it.index), None)
+            self.unsent.pop((it.run, it.index), None)
 
-    async def wait_for_model() -> None:
-        # The first launch downloads the model (~1.6 GB) while the page may already be capturing:
-        # keep that speech queued and transcribe it (merged, see take_batch) once the model is
-        # ready, instead of dropping it. The page shows the backlog meanwhile.
-        if transcriber.status in ("idle", "loading"):
-            await send_backlog()
-            while transcriber.status in ("idle", "loading"):
-                await asyncio.sleep(MODEL_WAIT_POLL_S)
+    # ------------------------------------------------------------ Whisper: live partials
 
-    async def worker() -> None:
-        carry: Segment | None = None
-        while True:
-            try:
-                first = carry or await queue.get()
-                carry = None
-                in_hand[0] = 1
-                await wait_for_model()
-                items, carry = take_batch(first, queue)
-                in_hand[0] = len(items) + (carry is not None)
-                try:
-                    await transcribe_batch(items)
-                    await send_run_done(items[0].run)
-                finally:
-                    in_hand[0] = carry is not None
-                await send_backlog()
-            except Exception:  # noqa: BLE001 - one bad batch must not stop transcription for good
-                if ws.client_state != WebSocketState.CONNECTED:
-                    return  # the page went away; ws_audio cancels this task anyway
-                log.exception("ASR worker failed on a batch; continuing")
-                carry, in_hand[0] = None, 0
+    def maybe_partial(self) -> None:
+        # Finals take priority: skip while one is queued or running.
+        if not self.use_partials or self.partial_busy or transcriber.status != "ready":
+            return
+        if not self.queue.empty() or gpu_lock.locked() or not self.seg.speaking:
+            return
+        if self.seg.frames_seen - self.partial_frame < self.partial_every:
+            return
+        audio = self.seg.current_audio()
+        if audio is None or len(audio) < PARTIAL_MIN_AUDIO_S * 16000:
+            return
+        self.partial_busy = True
+        self.partial_frame = self.seg.frames_seen
+        audio_end = round((self.bases.get(self.run, 0) + self.seg.frames_seen * FRAME) / 16000, 3)
+        # The event loop only keeps weak references to tasks: hold one until it is done.
+        t = asyncio.create_task(self.run_partial(audio, self.seg.index, audio_end))
+        self.partial_tasks.add(t)
+        t.add_done_callback(self.partial_tasks.discard)
 
-    # Bumped whenever the recognition language mode changes. A partial that started under an
-    # older mode (it runs in a worker thread) neither caches the language it detected nor shows
-    # its text. lang_lock keeps the mode, its generation and the cache consistent across threads.
-    mode_gen = [0]
-    lang_lock = threading.Lock()
+    async def run_partial(self, audio, index: int, audio_end: float) -> None:
+        # audio_end: the stream position (seconds) of the newest audio in `audio`; the page shows
+        # how long after sending that audio its text came back.
+        started_in = self.run  # 开始 pressed again meanwhile: the index means another segment now
+        try:
+            async with gpu_lock:
+                if index <= self.final_sent:
+                    return
+                text = await to_thread_to_end(self.partial_job, audio, index, started_in)
+            if text and index > self.final_sent and index not in self.gone and self.run == started_in:
+                await self.ws.send_json({"type": "partial", "index": index, "text": text, "audio_end": audio_end})
+        except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
+            log.debug("Partial transcription failed", exc_info=True)
+        finally:
+            self.partial_busy = False
 
-    def partial_job(audio, index: int, started_in: int) -> str:
-        with lang_lock:
-            gen, lang = mode_gen[0], opts["language"]
-            cached = live["lang"] if live["lang_index"] == index else ""
+    def partial_job(self, audio, index: int, started_in: int) -> str:
+        """Runs in a worker thread (see lang_lock)."""
+        with self.lang_lock:
+            gen, lang = self.mode_gen, self.language
+            cached = self.detected_lang if self.detected_index == index else ""
         if not is_fixed(lang):
             if cached:
                 lang = cached
             else:
                 lang, _ = transcriber.pick_language(audio, detect_among(lang))
                 if len(audio) >= PARTIAL_LANG_LOCK_S * 16000:
-                    with lang_lock:
-                        if mode_gen[0] == gen:
-                            live["lang_index"], live["lang"] = index, lang
+                    with self.lang_lock:
+                        if self.mode_gen == gen:
+                            self.detected_index, self.detected_lang = index, lang
         if alignatt_on():
-            state = shown.setdefault((started_in, index), alignatt.StreamState())
-            text = transcriber.transcribe_partial(audio, lang, opts["prompt"], state)
+            state = self.shown.setdefault((started_in, index), alignatt.StreamState())
+            text = transcriber.transcribe_partial(audio, lang, self.prompt, state)
         else:
-            text = transcriber.transcribe_partial(audio, lang, opts["prompt"])
-        with lang_lock:
-            return text if mode_gen[0] == gen else ""
+            text = transcriber.transcribe_partial(audio, lang, self.prompt)
+        with self.lang_lock:
+            return text if self.mode_gen == gen else ""
 
-    async def run_partial(audio, index: int, audio_end: float) -> None:
-        # audio_end: the stream position (seconds) of the newest audio in `audio`; the page shows
-        # how long after sending that audio its text came back.
-        started_in = run[0]  # 开始 pressed again meanwhile: the index means another segment now
-        try:
-            async with gpu_lock:
-                if index <= live["final_sent"]:
-                    return
-                text = await to_thread_to_end(partial_job, audio, index, started_in)
-            if text and index > live["final_sent"] and index not in gone and run[0] == started_in:
-                await ws.send_json({"type": "partial", "index": index, "text": text, "audio_end": audio_end})
-        except Exception:  # noqa: BLE001 - a lost partial is harmless; the final pass follows
-            log.debug("Partial transcription failed", exc_info=True)
-        finally:
-            live["busy"] = False
 
-    def maybe_partial() -> None:
-        # Finals take priority: skip while one is queued or running.
-        if not opts["partial"] or live["busy"] or transcriber.status != "ready":
-            return
-        if not queue.empty() or gpu_lock.locked() or not seg.speaking:
-            return
-        if seg.frames_seen - live["last_frame"] < partial_every:
-            return
-        audio = seg.current_audio()
-        if audio is None or len(audio) < PARTIAL_MIN_AUDIO_S * 16000:
-            return
-        live["busy"] = True
-        live["last_frame"] = seg.frames_seen
-        # The event loop only keeps weak references to tasks: hold one until it is done.
-        audio_end = round((bases.get(run[0], 0) + seg.frames_seen * FRAME) / 16000, 3)
-        t = asyncio.create_task(run_partial(audio, seg.index, audio_end))
-        partial_tasks.add(t)
-        t.add_done_callback(partial_tasks.discard)
-
-    partial_tasks: set[asyncio.Task] = set()
-    task = asyncio.create_task(worker())
-    speaking = False
-    last_level = 0.0
-    rec: list[wave.Wave_write | None] = [None]
-
-    def close_recording() -> None:
-        if rec[0] is not None:
-            rec[0].close()
-            rec[0] = None
+@app.websocket("/ws")
+async def ws_audio(ws: WebSocket) -> None:
+    """The page's capture: binary messages are its audio, text messages JSON (see AudioSession)."""
+    await ws.accept()
+    clients.add(ws)
+    await ws.send_json(status_message())
+    session = AudioSession(ws)
     try:
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("bytes") is not None:
-                if RECORD:
-                    if rec[0] is None:
-                        rec[0] = open_recording()
-                    rec[0].writeframes(msg["bytes"])
-                new = seg.feed(msg["bytes"])
-                if cloud[0]:
-                    # AssemblyAI finds the sentences itself; the VAD only feeds the status bar.
-                    seg.take_dropped()
-                    if run[0] in streams:
-                        streams[run[0]].feed(msg["bytes"])
-                else:
-                    for s in new:
-                        s.run = run[0]
-                        unsent[(s.run, s.index)] = round(s.start * 16000)
-                        queue.put_nowait(s)
-                    if new:
-                        await send_backlog()
-                    await send_dropped()
-                now = time.monotonic()
-                if seg.speaking != speaking or now - last_level >= VAD_LEVEL_INTERVAL_S:
-                    speaking = seg.speaking
-                    last_level = now
-                    await ws.send_json({
-                        "type": "vad",
-                        "speaking": speaking,
-                        "prob": round(seg.take_peak_prob(), 2),
-                        **commit_info(),
-                    })
-                if not cloud[0]:
-                    maybe_partial()
+                await session.on_audio(msg["bytes"])
             elif msg.get("text"):
-                data = json.loads(msg["text"])
-                kind = data.get("type")
-                if kind == "config":
-                    asr = data.get("asr") or {}
-                    apply_config(seg, asr)
-                    mode = normalize_language(asr.get("language"))
-                    if mode and mode != opts["language"]:
-                        # The language detected for the segment in progress was chosen under the
-                        # old mode: detect again for its next partials, and drop partials still
-                        # running under the old mode (see partial_job).
-                        with lang_lock:
-                            opts["language"] = mode
-                            mode_gen[0] += 1
-                            live.update(lang_index=0, lang="")
-                        ctx.update(text="", lang="")
-                    if "partial" in asr:
-                        opts["partial"] = bool(asr["partial"])
-                    if "context" in asr:
-                        opts["context"] = bool(asr["context"])
-                    if "model" in asr or "compute" in asr:
-                        request_model(asr.get("model"), asr.get("compute"))
-                    opts["prompt"] = (data.get("prompt") or "")[:1000]
-                    if asr.get("engine") in ("local", "assemblyai"):
-                        opts["engine"] = asr["engine"]
-                    if isinstance(asr.get("assemblyai_key"), str):
-                        opts["key"] = asr["assemblyai_key"].strip()
-                    opts["ai_model"] = assembly.normalize_model(asr.get("assemblyai_model")) or opts["ai_model"]
-                    if opts["engine"] == "local":
-                        await need_whisper()
-                    if run[0] in streams:  # language or glossary changed while capturing
-                        streams[run[0]].update(opts["language"], assembly.keyterms(opts["prompt"]))
-                elif kind == "prepare":
-                    # 开始 was pressed: the page now asks for its audio sources (a window picker,
-                    # a permission prompt), and "start" follows once it has them. Connect meanwhile.
-                    drop_spare()
-                    key = data.get("assemblyai_key")
-                    key = key.strip() if isinstance(key, str) else opts["key"]
-                    ai_model = assembly.normalize_model(data.get("assemblyai_model")) or opts["ai_model"]
-                    if data.get("engine") == "assemblyai" and key:
-                        stream = assembly.AssemblyStream(
-                            key, ai_model, opts["language"],
-                            assembly.keyterms(opts["prompt"]), on_stream,
-                        )
-                        spare.update(
-                            stream=stream,
-                            timer=asyncio.get_running_loop().call_later(SPARE_KEEP_S, drop_spare),
-                        )
-                        stream.start()
-                elif kind == "unprepare":  # no sources after all
-                    drop_spare()
-                elif kind in ("start", "resume"):
-                    # "resume": a reconnecting page continues its stream at `offset` and resends
-                    # the audio from there; segment start times continue from that position.
-                    old = run[0]
-                    r = data.get("run")
-                    run[0] = r if isinstance(r, int) and not isinstance(r, bool) else run[0] + 1
-                    seg.reset()
-                    gone.clear()
-                    shown.clear()
-                    live.update(last_frame=0, final_sent=0, lang_index=0, lang="")
-                    ctx.update(text="", lang="")
-                    bases[run[0]] = max(0, int(data.get("offset") or 0)) if kind == "resume" else 0
-                    if old != run[0] and old in streams:
-                        streams[old].close()  # normally closed already, by "stop"
-                    if run[0] in streams:
-                        streams.pop(run[0]).abort()
-                    # The run's engine, key and model come with the message: the page fixes them
-                    # when the run starts and repeats them on "resume". The settings may have
-                    # changed since (they apply from the next 开始), and audio captured for the
-                    # local engine must not be sent to AssemblyAI when the run is resumed.
-                    engine = data.get("engine") if data.get("engine") in ("local", "assemblyai") else opts["engine"]
-                    key = data.get("assemblyai_key")
-                    key = key.strip() if isinstance(key, str) else opts["key"]
-                    ai_model = assembly.normalize_model(data.get("assemblyai_model")) or opts["ai_model"]
-                    cloud[0] = engine == "assemblyai"
-                    spare_state = spare["state"]
-                    stream = take_spare(key, ai_model) if cloud[0] and kind == "start" else drop_spare()
-                    if stream:
-                        # Connected (or connecting) since "prepare": the settings may have changed.
-                        stream.run = run[0]
-                        streams[run[0]] = stream
-                        stream.update(opts["language"], assembly.keyterms(opts["prompt"]))
-                        await ws.send_json({
-                            "type": "engine", "state": spare_state or "connecting",
-                            "model": stream.model, "run": stream.run,
-                        })
-                    elif cloud[0]:
-                        stream = assembly.AssemblyStream(
-                            key, ai_model, opts["language"],
-                            assembly.keyterms(opts["prompt"]), on_stream,
-                        )
-                        stream.run = run[0]
-                        streams[run[0]] = stream
-                        stream.start()
-                    else:
-                        await need_whisper()
-                    if old and old != run[0]:  # 0: no run yet on this connection
-                        await send_run_done(old)
-                elif kind == "stop":
-                    close_recording()
-                    new = seg.flush()
-                    if cloud[0]:
-                        new = []
-                        seg.take_dropped()
-                        if run[0] in streams:
-                            streams[run[0]].close()
-                    for s in new:
-                        s.run = run[0]
-                        unsent[(s.run, s.index)] = round(s.start * 16000)
-                        queue.put_nowait(s)
-                    if new:
-                        await send_backlog()
-                    await send_dropped()
-                    speaking = False
-                    await ws.send_json({"type": "vad", "speaking": False})
+                await session.on_text(msg["text"])
     except WebSocketDisconnect:
         pass
     finally:
-        close_recording()
         clients.discard(ws)
-        task.cancel()
-        for t in partial_tasks:
-            t.cancel()
-        for stream in streams.values():
-            stream.abort()
-        if spare["timer"]:
-            spare["timer"].cancel()
-        if spare["stream"]:
-            spare["stream"].abort()
+        session.close()
 
 
 class NoCacheStaticFiles(StaticFiles):
