@@ -34,13 +34,16 @@ import numpy as np
 from asr import (
     PROGRESS_INTERVAL_S,
     clean_text,
+    clean_text_why,
     collapse_repeats,
     detect_among,
     echoes_context,
     fit_prompt,
     is_fixed,
     normalize_language,
+    note_dropped,
     unreliable,
+    unreliable_why,
     IT_EN,
 )
 
@@ -307,9 +310,11 @@ class AlignAttModel:
         context: str = "",
         context_lang: str = "",
         state: StreamState | None = None,
+        *,
+        dropped: list | None = None,
     ) -> dict:
-        """A whole segment, as asr.Transcriber.transcribe. The words shown while it was spoken
-        (`state`) are kept as its start, so the final text only adds to them."""
+        """A whole segment, as asr.Transcriber.transcribe (`dropped` too). The words shown while it
+        was spoken (`state`) are kept as its start, so the final text only adds to them."""
         t0 = time.time()
         mode = normalize_language(language) or IT_EN
         feats, frames = self.encode(audio)
@@ -326,11 +331,16 @@ class AlignAttModel:
             context = ""
         initial = fit_prompt(self.count_tokens, prompt, context) if prompt or context else ""
         new, _, stats = self.decode(feats, frames, lang, initial, forced, is_last=True)
-        if unreliable(stats):
-            new = []  # an unsure ending: keep only the words already shown
         tok = self.tokenizer(lang)
-        text = clean_text(tok.decode(forced + new), prompt) if forced + new else ""
+        why = unreliable_why(stats)
+        if why:
+            note_dropped(dropped, tok.decode(new), why)
+            new = []  # an unsure ending: keep only the words already shown
+        raw = tok.decode(forced + new) if forced + new else ""
+        text, why = clean_text_why(raw, prompt)
+        note_dropped(dropped, raw, why)
         if context and echoes_context(text, context):
+            note_dropped(dropped, text, "context echo")
             text = ""
         return {
             "lang": lang,
