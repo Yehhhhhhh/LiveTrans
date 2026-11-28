@@ -140,22 +140,32 @@ def split_prompt(prompt: str) -> tuple[set[str], set[str]]:
 
 def clean_text(text: str, prompt: str = "") -> str:
     """Return the text with repeat loops collapsed, or "" if it looks like a hallucination."""
+    return clean_text_why(text, prompt)[0]
+
+
+def clean_text_why(text: str, prompt: str = "") -> tuple[str, str]:
+    """clean_text's result, and why it is "" when the text had something in it: "phrase: <the
+    phrase it matched>", "url only", "filler", "stock phrase", "no words", "hint echo" or
+    "glossary echo". The reason is "" when the text is kept (or was empty). For tools/replay.py."""
     raw = text.strip()
     text = collapse_repeats(raw)
-    if not text or HALLUCINATIONS.search(text):
-        return ""
+    if not text:
+        return "", ""
+    phrase = HALLUCINATIONS.search(text)
+    if phrase:
+        return "", f"phrase: {phrase.group(0).lower()}"
     if _URL.search(text):
         rest = _WORD.findall(_URL.sub(" ", text).lower())
         if all(w in FUNCTION_WORDS for w in rest):
-            return ""
+            return "", "url only"
     words = _WORD.findall(text.lower())
     # A loop of one or two filler words ("e e e e", "si si si") has nothing worth showing.
     if len(words) <= 2 and text != raw:
-        return ""
+        return "", "filler"
     # Every clause a stock phrase ("Grazie, grazie.", "Grazie. Grazie a tutti.").
     clauses = [" ".join(_WORD.findall(c)) for c in _CLAUSE.split(text.lower())]
     if all(STOCK_PHRASES.match(c) for c in clauses if c):
-        return ""
+        return "", "stock phrase" if words else "no words"
     # Echo of the glossary prompt: content words that all come from the prompt (or its course
     # hint) are Whisper reciting its prompt, not the lecturer speaking.
     content = [w for w in words if w not in FUNCTION_WORDS]
@@ -166,10 +176,17 @@ def clean_text(text: str, prompt: str = "") -> str:
     hint_content = hint - FUNCTION_WORDS
     echo_min = min(2, len(hint_content))
     if hint and content and all(w in hint for w in content) and len(set(content)) >= echo_min:
-        return ""
+        return "", "hint echo"
     if vocab and len(content) >= 3 and all(w in vocab or w in hint for w in content):
-        return ""
-    return text
+        return "", "glossary echo"
+    return text, ""
+
+
+def note_dropped(dropped: list | None, text: str, why: str) -> None:
+    """Add (text, reason) to `dropped` (see Transcriber.transcribe) when text was thrown away."""
+    text = " ".join(text.split())
+    if why and text and dropped is not None:
+        dropped.append((text, why))
 
 
 # faster-whisper keeps only the last 223 tokens of a prompt (half of Whisper's 448-token window,
@@ -238,9 +255,18 @@ def unreliable(s) -> bool:
     """Whether a decoded Whisper segment should be thrown away: still a repeat loop, very unsure,
     or probably not speech at all. On noise, music or a breath Whisper writes a fluent sentence
     anyway ("I'm going to go to the next level of..."); these scores are what gives it away."""
-    if s.compression_ratio > 2.4 or s.avg_logprob < -1.0:
-        return True
-    return s.no_speech_prob > 0.5 and s.avg_logprob < -0.5
+    return bool(unreliable_why(s))
+
+
+def unreliable_why(s) -> str:
+    """Why unreliable(s) holds ("repeats: …", "unsure: …", "no speech: …", with the score), or ""."""
+    if s.compression_ratio > 2.4:
+        return f"repeats: compression ratio {s.compression_ratio:.2f}"
+    if s.avg_logprob < -1.0:
+        return f"unsure: avg logprob {s.avg_logprob:.2f}"
+    if s.no_speech_prob > 0.5 and s.avg_logprob < -0.5:
+        return f"no speech: probability {s.no_speech_prob:.2f}"
+    return ""
 
 
 def setup_cuda_dlls() -> None:
@@ -486,13 +512,17 @@ class Transcriber:
         context: str = "",
         context_lang: str = "",
         state=None,
+        *,
+        dropped: list | None = None,
     ) -> dict:
         """`context` is the text recognized just before this audio, in `context_lang`. It is given
         to Whisper as the transcript so far (see fit_prompt), but only when this audio is in the
         same language: text in another language pulls the decoding toward that language.
-        `state`: the segment's live state, see transcribe_partial."""
+        `state`: the segment's live state, see transcribe_partial. `dropped`, when given, collects
+        what the hallucination checks threw away, as (decoded text, reason) pairs (see
+        clean_text_why, unreliable_why; tools/replay.py reports them)."""
         if self.engine:
-            return self.engine.transcribe(audio, language, prompt, context, context_lang, state)
+            return self.engine.transcribe(audio, language, prompt, context, context_lang, state, dropped=dropped)
         t0 = time.time()
         mode = normalize_language(language) or IT_EN
         if is_fixed(mode):
@@ -517,13 +547,16 @@ class Transcriber:
         parts = []
         for s in segments:
             # Even after temperature fallback Whisper returns its last attempt; reject it here.
-            if unreliable(s):
-                continue
-            text = clean_text(s.text, prompt)
-            if text:
-                parts.append(text)
-        text = clean_text(" ".join(parts), prompt)
+            why = unreliable_why(s)
+            if not why:
+                text, why = clean_text_why(s.text, prompt)
+                if text:
+                    parts.append(text)
+            note_dropped(dropped, s.text, why)
+        text, why = clean_text_why(" ".join(parts), prompt)
+        note_dropped(dropped, " ".join(parts), why)
         if context and echoes_context(text, context):
+            note_dropped(dropped, text, "context echo")
             text = ""
         return {
             "lang": lang,
