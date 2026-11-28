@@ -221,12 +221,42 @@
 .venv\Scripts\python -m pytest backend\tests
 ```
 
+## 离线回放（调参用）
+
+`backend/tools/replay.py` 把录好的课堂音频离线回放进本地识别管线（VAD 断句 → Whisper / AlignAtt），用数据比较 VAD 参数、模型和幻觉过滤：
+
+1. 设置 `LIVETRANS_RECORD=1` 上一节课，原始音频保存在 `recordings/`（16kHz 单声道 WAV）。
+2. 要算 WER / CER 时，准备这段录音的逐字稿（UTF-8 纯文本）。
+3. 运行：
+
+   ```
+   .venv\Scripts\python backend\tools\replay.py recordings\20261128-101500.wav --ref 逐字稿.txt
+eplay.py recordings61128-101500.wav --ref 逐字稿.txt
+   ```
+
+输出带时间戳的识别文本，最后汇总：
+
+- **WER / CER**（有 `--ref` 时）：忽略大小写、标点和撇号。
+- **段结束 → 最终结果的延迟**：和页面上的识别延迟同一口径，并拆成等句末停顿、排队、识别三部分。
+- **实时显示**：更新次数、改写次数（已显示的词被改掉）、每次更新的耗时、每段第一次出字的时间。
+- **被幻觉过滤丢掉的文字**：原文和原因，用来发现误杀（真实的句子被当成幻觉丢掉）。
+
+模型调用都真实运行，时间按模拟时钟计算：音频按每 100ms 一块到达，显卡一次只做一件事、最终识别优先、积压时合并识别，规则和后端相同。所以回放用时约等于显卡忙的时间（不是录音长度），报告的延迟就是这台电脑上实时识别时页面会显示的延迟。
+
+常用选项（`--help` 看全部）：
+
+- `--model large-v3`、`--model alignatt-large-v3-turbo`（AlignAtt 模式）、`--compute int8_float16`。
+- `--language it`（默认 `it_en`）；`--prompt "Lezione di economia. PIL, inflazione"`：识别提示，格式同页面。
+- `--threshold 0.4 --min-silence-ms 500 --max-segment-s 10`：断句参数，`vad.SegmenterParams` 的每一项都能改。
+- `--no-partial`：不做实时显示，快很多，只看 WER 和最终结果的延迟；`--show-partials`：打印每次实时显示的文字。
+- `--json 结果.json`：保存全部结果，方便比较两次回放。
+
 ## 结构
 
 ```
 backend/requirements.txt  Python 依赖（版本范围）
 backend/requirements.lock 测试过的精确版本，install.bat 用它安装
-backend/tools/         freeze_lock.py：由当前环境生成 requirements.lock
+backend/tools/         freeze_lock.py：由当前环境生成 requirements.lock；replay.py：离线回放录音，量化识别质量和实时性
 backend/server.py      FastAPI：/ws 音频流、/api/translate 翻译代理、/api/window 窗口信息、静态页面
 backend/vad.py         Silero VAD 流式断句
 backend/asr.py         faster-whisper 识别（识别语言模式）、幻觉过滤
