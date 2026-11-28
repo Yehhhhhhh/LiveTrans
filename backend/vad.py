@@ -133,7 +133,7 @@ class Segmenter:
     def committed_frames(self) -> int:
         """Frames before which no audio can still become part of a future segment: the start of
         the segment in progress, or of the pre-roll a new segment would begin with. A client that
-        reconnects resends audio from here (see ws_audio)."""
+        reconnects resends audio from here (see server.AudioSession)."""
         if self.in_speech:
             return self.seg_start_frame
         return self.frames_seen - len(self.preroll)
