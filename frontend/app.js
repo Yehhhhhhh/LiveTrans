@@ -814,7 +814,9 @@ async function postTranslate(body, onText = () => {}, signal = undefined) {
 async function contextFor(seg) {
   const list = !seg || seg.sessionId === state.session?.id ? state.segments : await db.getSegments(seg.sessionId);
   const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
-  const n = Number(settings.tr.contextSize) || 0;
+  const n = Math.floor(Number(settings.tr.contextSize) || 0);
+  // .slice(-n) below would be .slice(0) for 0, i.e. every earlier segment.
+  if (n <= 0) return [];
   return list
     .slice(0, idx < 0 ? list.length : idx)
     .filter((s) => s.trStatus === 'done' || s.trStatus === 'pending' || s.trStatus === 'streaming')
