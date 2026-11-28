@@ -93,6 +93,7 @@ const state = {
   ws: null,
   wsReady: false,
   running: false,
+  starting: false, // 开始 is waiting for its sources (see start)
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
   run: 0, // capture run sent with every 'start'; the backend echoes it in its results
@@ -814,7 +815,9 @@ async function postTranslate(body, onText = () => {}, signal = undefined) {
 async function contextFor(seg) {
   const list = !seg || seg.sessionId === state.session?.id ? state.segments : await db.getSegments(seg.sessionId);
   const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
-  const n = Number(settings.tr.contextSize) || 0;
+  const n = Math.floor(Number(settings.tr.contextSize) || 0);
+  // .slice(-n) below would be .slice(0) for 0, i.e. every earlier segment.
+  if (n <= 0) return [];
   return list
     .slice(0, idx < 0 ? list.length : idx)
     .filter((s) => s.trStatus === 'done' || s.trStatus === 'pending' || s.trStatus === 'streaming')
@@ -1444,7 +1447,22 @@ async function describeShare(input) {
   }
 }
 
+// Capture begins only once the sources are granted (window picker, permission prompt). A second
+// click on 开始 meanwhile must not start a second capture: both would send audio into the same
+// stream, and 停止 could only stop one of them.
 async function start() {
+  if (state.starting) return;
+  state.starting = true;
+  $('startBtn').disabled = true;
+  try {
+    await startCapture();
+  } finally {
+    state.starting = false;
+    $('startBtn').disabled = false;
+  }
+}
+
+async function startCapture() {
   if (!state.wsReady) {
     showMsg('后端未连接，请先运行 start.bat');
     return;
