@@ -13,6 +13,7 @@ SPEECH = [
     "Grazie per l'attenzione, ci vediamo giovedì per la prossima lezione.",
     "Grazie per l’attenzione, ci vediamo giovedì.",  # typographic apostrophe
     "Iscriviti al canale Teams del corso, lì trovi le registrazioni.",
+    "Vedi example.com/course per le slide.",
 ]
 
 # What Whisper writes on noise or silence: subtitle credits, video outros, a bare web address.
@@ -32,6 +33,8 @@ HALLUCINATED = [
     "Like and subscribe!",
     "www.fema.gov",
     "https://www.example.com",
+    "example.com/course",  # a bare domain with a path
+    "fema.gov/disaster-assistance?lang=en#top",
     "Grazie, grazie.",
     "Thank you.",
 ]

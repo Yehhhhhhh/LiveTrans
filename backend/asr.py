@@ -67,9 +67,10 @@ STOCK_PHRASES = re.compile(
     re.I,
 )
 
-# A web address. An output that is nothing but one is a credit line ("www.fema.gov"); a sentence
-# mentioning one ("Le slide sono su www.polimi.it") is speech.
-_URL = re.compile(r"(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|gov)\b", re.I)
+# A web address, with its path, query or fragment. An output that is nothing but one is a credit
+# line ("www.fema.gov", "example.com/course"); a sentence mentioning one ("Le slide sono su
+# www.polimi.it") is speech.
+_URL = re.compile(r"(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|gov)\b(?:[/?#]\S*)?", re.I)
 
 # Ignored when deciding whether an output only echoes the prompt.
 FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
