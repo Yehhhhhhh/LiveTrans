@@ -46,20 +46,30 @@ def detect_among(mode: str) -> tuple[str, ...] | None:
 def is_fixed(mode: str) -> bool:
     return mode not in (ANY, IT_EN)
 
-# Phrases Whisper tends to hallucinate on noise or silence.
+# Subtitle credits and video outros Whisper hallucinates on noise or silence. A lecturer doesn't
+# say them, so an output containing one is dropped whole. Phrases a lecturer might say too
+# ("grazie per l'attenzione", "iscriviti", a web address) are in STOCK_PHRASES / _URL instead.
 HALLUCINATIONS = re.compile(
-    r"(amara\.org|sottotitoli (creati|a cura|e revisione)|grazie per (la visione|l'attenzione|aver guardato)"
-    r"|thanks? (you )?for watching|subscribe|iscriviti|www\.|\.com\b)",
+    r"(amara\.org|sottotitoli (creati|a cura|e revisione)|grazie per (la visione|aver guardato)"
+    r"|thanks? (you )?for watching)",
     re.I,
 )
 
 # Whole outputs Whisper produces on noise / silence (outro-subtitle habits). Matched against
-# the entire segment text, after repeats are collapsed, so real sentences containing them survive.
+# each clause of the segment text, after repeats are collapsed: the segment is dropped only when
+# every clause is one, so real sentences containing them survive ("Grazie per l'attenzione, ci
+# vediamo giovedì", "Iscriviti all'esame entro venerdì", "Subscribe to the mailing list").
 STOCK_PHRASES = re.compile(
     r"^(grazie( a tutti| mille| ancora| a voi)?|thank you( (very much|all|everyone|so much))?|thanks"
-    r"|ciao( a tutti)?|bye( bye)?|wtf|you|buona (visione|serata|giornata)|alla prossima)$",
+    r"|ciao( a tutti)?|bye( bye)?|wtf|you|buona (visione|serata|giornata)|alla prossima"
+    r"|grazie per l[' ]?attenzione|(please )?subscribe( to (my|our|the) channel)?|like and subscribe"
+    r"|iscriviti( al (mio |nostro )?canale)?)$",
     re.I,
 )
+
+# A web address. An output that is nothing but one is a credit line ("www.fema.gov"); a sentence
+# mentioning one ("Le slide sono su www.polimi.it") is speech.
+_URL = re.compile(r"(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|gov)\b", re.I)
 
 # Ignored when deciding whether an output only echoes the prompt.
 FUNCTION_WORDS = {"e", "di", "a", "la", "il", "le", "and", "the", "of", "to"}
@@ -133,6 +143,10 @@ def clean_text(text: str, prompt: str = "") -> str:
     text = collapse_repeats(raw)
     if not text or HALLUCINATIONS.search(text):
         return ""
+    if _URL.search(text):
+        rest = _WORD.findall(_URL.sub(" ", text).lower())
+        if all(w in FUNCTION_WORDS for w in rest):
+            return ""
     words = _WORD.findall(text.lower())
     # A loop of one or two filler words ("e e e e", "si si si") has nothing worth showing.
     if len(words) <= 2 and text != raw:
