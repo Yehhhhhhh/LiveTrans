@@ -25,9 +25,20 @@ test('pickContext uses the whole list when the target is null or absent', () => 
   assert.deepEqual(pickContext(list, { id: 9 }, 5), [{ src: 'one', tgt: 'uno' }]);
 });
 
-test('pickContext with context size zero returns no history', { todo: 'contextSize 0 still returns everything (.slice(-0)); known bug, fixed separately' }, () => {
+test('pickContext with context size zero (or below one) returns no history', () => {
   const list = [{ id: 1, text: 'one', trStatus: 'done', translation: 'uno' }];
   assert.deepEqual(pickContext(list, null, 0), []);
+  assert.deepEqual(pickContext(list, null, '0'), []);
+  assert.deepEqual(pickContext(list, null, 0.5), []);
+  assert.deepEqual(pickContext(list, null, ''), []);
+});
+
+test('pickContext rounds a fractional context size down', () => {
+  const list = [
+    { id: 1, text: 'one', trStatus: 'done', translation: 'uno' },
+    { id: 2, text: 'two', trStatus: 'done', translation: 'due' },
+  ];
+  assert.deepEqual(pickContext(list, null, 1.9), [{ src: 'two', tgt: 'due' }]);
 });
 
 test('buildTranslationRequest uses the local provider and matches glossary across source context', () => {

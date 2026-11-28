@@ -226,7 +226,22 @@ async function describeShare(input) {
   }
 }
 
+// Capture begins only once the sources are granted (window picker, permission prompt). A second
+// click on 开始 meanwhile must not start a second capture: both would send audio into the same
+// stream, and 停止 could only stop one of them.
 async function start() {
+  if (state.starting) return;
+  state.starting = true;
+  $('startBtn').disabled = true;
+  try {
+    await startCapture();
+  } finally {
+    state.starting = false;
+    $('startBtn').disabled = false;
+  }
+}
+
+async function startCapture() {
   if (!state.wsReady) {
     showMsg('后端未连接，请先运行 start.bat');
     return;

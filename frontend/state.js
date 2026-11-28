@@ -44,6 +44,7 @@ export const state = {
   ws: null,
   wsReady: false,
   running: false,
+  starting: false, // 开始 is waiting for its sources (see start in audio.js)
   audio: null, // { ctx, node, inputs: { sys?, mic? } }
   switching: false, // a source swap is waiting on a permission prompt
   run: 0, // capture run sent with every 'start'; the backend echoes it in its results

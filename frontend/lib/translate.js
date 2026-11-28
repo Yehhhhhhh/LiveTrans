@@ -4,11 +4,12 @@ import { relevantGlossary } from './glossary.js';
 // The context for translating `seg`: the last `contextSize` segments before it in `list` (all of
 // `list` when seg is null or not in it), skipping ones whose translation failed or is off.
 // Translated ones come with their translation; ones still being translated (translations run in
-// parallel) with their source text only. (A contextSize of 0 still takes them all, as before
-// this was moved here: .slice(-0) is .slice(0).)
+// parallel) with their source text only.
 export function pickContext(list, seg, contextSize) {
   const idx = seg ? list.findIndex((s) => s.id === seg.id) : -1;
-  const n = Number(contextSize) || 0;
+  const n = Math.floor(Number(contextSize) || 0);
+  // .slice(-n) below would be .slice(0) for 0, i.e. every earlier segment.
+  if (n <= 0) return [];
   return list
     .slice(0, idx < 0 ? list.length : idx)
     .filter((s) => s.trStatus === 'done' || s.trStatus === 'pending' || s.trStatus === 'streaming')
