@@ -43,6 +43,7 @@ button, select, input {
   padding: 4px 10px;
 }
 button { cursor: pointer; }
+button:disabled { opacity: 0.6; cursor: progress; }
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); min-width: 72px; }
 button.primary.running { background: var(--danger); border-color: var(--danger); }
