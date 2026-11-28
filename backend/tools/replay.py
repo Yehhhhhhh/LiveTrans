@@ -88,7 +88,7 @@ class Final:
 
 
 class Replay:
-    """The local-Whisper path of server.ws_audio, on a simulated clock (see the module docstring).
+    """The local-Whisper path of server.AudioSession, on a simulated clock (see the module docstring).
 
     Mirrored from there: when a live partial may start (maybe_partial: the GPU idle and no final
     waiting, at most every PARTIAL_INTERVAL_S, on at least PARTIAL_MIN_AUDIO_S of audio), which
@@ -126,7 +126,7 @@ class Replay:
         self.starts: dict[int, float] = {}  # segment index -> where its audio starts
         self.closed: dict[int, float] = {}  # segment index -> when the VAD closed it
         self.gone: dict[int, float] = {}  # segment index -> when the VAD dropped it as noise
-        self.last_frame = 0  # the server's live["last_frame"], live["lang_index"], live["lang"]
+        self.last_frame = 0  # AudioSession.partial_frame and its cached partial language
         self.lang_index, self.lang = 0, ""
         self.states: dict[int, StreamState] = {}  # AlignAtt: what the partials showed (server: shown)
         self.ctx = {"text": "", "lang": "", "end": 0.0}
